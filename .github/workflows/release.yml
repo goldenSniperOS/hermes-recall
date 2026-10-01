@@ -60,22 +60,23 @@ jobs:
             echo ""
             echo "New install:"
             echo '```bash'
-            echo "hermes plugins install ${GITHUB_REPOSITORY} --enable"
+            echo "hermes plugins install ${GITHUB_REPOSITORY}"
+            echo "hermes config set memory.provider recall"
             echo '```'
             echo ""
             echo "Pinned to this release:"
             echo '```bash'
-            echo "hermes plugins install ${GITHUB_REPOSITORY} --ref ${GITHUB_SHA} --enable"
+            echo "hermes plugins install ${GITHUB_REPOSITORY} --ref ${GITHUB_SHA}"
             echo '```'
             echo ""
             echo "Update an agent installed without --ref:"
             echo '```bash'
-            echo "hermes plugins update hermes-recall"
+            echo "hermes plugins update recall"
             echo '```'
             echo ""
             echo "Update an agent installed with --ref (pinned):"
             echo '```bash'
-            echo "hermes plugins install ${GITHUB_REPOSITORY} --ref ${GITHUB_SHA} --force --enable"
+            echo "hermes plugins install ${GITHUB_REPOSITORY} --ref ${GITHUB_SHA} --force"
             echo '```'
             echo ""
             echo "Then restart the Hermes CLI or gateway (send /restart in a gateway chat)."

@@ -1,18 +1,18 @@
-
-# Build and tool artifacts
-# Local CodeGraph index
-# Local Pi runtime state
 # Python
-*.egg-info/
+__pycache__/
 *.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local tool and agent state
 .atl/
 .codegraph/
 .engram/
 .opencode-task.md
-.pytest_cache/
-.ruff_cache/
-.venv/
-__pycache__/
-build/
-dist/
+
+# Local reference copies (never commit)
 .refs/
