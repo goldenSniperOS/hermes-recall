@@ -1,0 +1,17 @@
+
+# Build and tool artifacts
+# Local CodeGraph index
+# Local Pi runtime state
+# Python
+*.egg-info/
+*.pyc
+.atl/
+.codegraph/
+.engram/
+.opencode-task.md
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+dist/
