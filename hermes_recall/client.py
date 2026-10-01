@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,7 +61,11 @@ class EngramClient:
         # a trailing slash would otherwise produce `//health`, which Go's
         # ServeMux answers with a redirect instead of the route.
         self._base_url = self._config.url.strip().rstrip("/")
-        self._last_error: str = ""
+        # Per thread: the provider's background worker and the tool-call thread
+        # share one client, and a failure on one must not be reported (or erased)
+        # as the other's. Every caller reads the reason on the thread that made
+        # the call.
+        self._errors = threading.local()
 
     # -- Introspection -------------------------------------------------------
 
@@ -71,12 +76,12 @@ class EngramClient:
 
     @property
     def last_error(self) -> str:
-        """The most recent failure reason, or ``""`` when the last call succeeded."""
-        return self._last_error
+        """The most recent failure reason on this thread, or ``""`` after a success."""
+        return getattr(self._errors, "message", "")
 
     def last_error_text(self) -> str:
-        """Return the last failure reason, or ``""`` when healthy."""
-        return self._last_error
+        """Return the last failure reason on this thread, or ``""`` when healthy."""
+        return getattr(self._errors, "message", "")
 
     # -- Transport -----------------------------------------------------------
 
@@ -86,7 +91,7 @@ class EngramClient:
         Never above debug: the provider is fail-soft, and an Engram server that
         is simply not running would otherwise print a warning on every turn.
         """
-        self._last_error = message
+        self._errors.message = message
         logger.debug("engram client: %s", message)
 
     def _request(
@@ -134,7 +139,7 @@ class EngramClient:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
                 raw = response.read()
-            self._last_error = ""
+            self._errors.message = ""
             if not raw:
                 return None
             try:
@@ -388,6 +393,50 @@ class EngramClient:
                 },
             )
         )
+
+    # -- Conflicts and pins --------------------------------------------------
+
+    def judge_conflict(
+        self,
+        judgment_id: str,
+        relation: str,
+        *,
+        reason: str = "",
+        evidence: str = "",
+        confidence: float | None = None,
+        session_id: str = "",
+    ) -> dict[str, Any] | None:
+        """``POST /conflicts/judge`` → ``{"relation": {...}}``.
+
+        ``judgment_id`` and ``relation`` are required by the server; blank optional
+        strings are omitted (the server treats ``""`` as "not given" anyway).
+        """
+        missing = [
+            name
+            for name, value in (("judgment_id", judgment_id), ("relation", relation))
+            if not value.strip()
+        ]
+        if missing:
+            self._record_error(
+                "POST /conflicts/judge: refused locally, blank required field(s): "
+                + ", ".join(missing)
+            )
+            return None
+        body: dict[str, Any] = {"judgment_id": judgment_id, "relation": relation}
+        for key, value in (("reason", reason), ("evidence", evidence), ("session_id", session_id)):
+            if value.strip():
+                body[key] = value
+        if confidence is not None:
+            body["confidence"] = confidence
+        return _as_dict(self._request("POST", "/conflicts/judge", body=body))
+
+    def pin_observation(self, observation_id: int) -> dict[str, Any] | None:
+        """``PUT /observations/{id}/pin`` → ``{"id", "pinned": true}``."""
+        return _as_dict(self._request("PUT", f"/observations/{observation_id}/pin"))
+
+    def unpin_observation(self, observation_id: int) -> dict[str, Any] | None:
+        """``DELETE /observations/{id}/pin`` → ``{"id", "pinned": false}``."""
+        return _as_dict(self._request("DELETE", f"/observations/{observation_id}/pin"))
 
     def stats(self, project: str = "", all_projects: bool = False) -> dict[str, Any] | None:
         """``GET /stats`` → store counters for one project or the whole server."""

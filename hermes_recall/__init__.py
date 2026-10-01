@@ -25,4 +25,35 @@ def register(ctx: Any) -> None:
     """
     from .provider import RecallProvider
 
-    ctx.register_memory_provider(RecallProvider())
+    provider = RecallProvider()
+    ctx.register_memory_provider(provider)
+    _register_slash_command(ctx, provider)
+
+
+def _register_slash_command(ctx: Any, provider: Any) -> None:
+    """Register ``/recall [id]`` when the context supports it. Never raises.
+
+    For an exclusive provider ``ctx`` is the loader's ``_ProviderCollector``, whose
+    ``__getattr__`` forwards every ``register_*`` call to a real ``PluginContext``
+    (``plugins/memory/__init__.py``). The call is guarded so a host without
+    ``register_command`` — or one whose registration fails — can never cost the
+    provider registration that already happened above.
+
+    Skipped when the collector says it is only *inspecting* the provider
+    (``register_skills=False``: ``hermes memory status``, the setup picker), so a
+    merely installed, inactive provider does not leak ``/recall`` into sessions.
+    """
+    try:
+        if getattr(ctx, "_register_skills", True) is False:
+            return
+        register_command = getattr(ctx, "register_command", None)
+        if not callable(register_command):
+            return
+        register_command(
+            "recall",
+            provider.recall_command,
+            description="Show Engram recall status, or one memory: /recall [id]",
+            args_hint="[id]",
+        )
+    except Exception:
+        pass

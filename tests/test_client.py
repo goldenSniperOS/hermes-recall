@@ -609,6 +609,9 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
     "add_prompt": (("sess-1", "content"), {}),
     "timeline": ((761,), {}),
     "stats": ((), {}),
+    "judge_conflict": (("rel-1", "related"), {}),
+    "pin_observation": ((761,), {}),
+    "unpin_observation": ((761,), {}),
 }
 
 # Public callables that are introspection, not HTTP, and so are not swept.

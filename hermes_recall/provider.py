@@ -8,14 +8,16 @@ import os
 import queue
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import client as client_module
+from . import tools as tools_module
 from ._hermes import MemoryProvider, RecallStatus, is_trivial_prompt
 from .client import EngramClient
-from .config import RecallConfig, load_config
+from .config import RecallConfig, load_config, resolve_hermes_home
 from .format import render_recall_block
 from .redact import strip_private, truncate
 
@@ -109,19 +111,8 @@ _ARCHIVE_UNKNOWN = "unknown"
 # return;``, index.ts ``tool_execution_end``) and for a sharp reason: capturing the
 # result of a `mem_search` would write recalled memories back in as new observations,
 # a feedback loop that inflates the store every time the model looks something up.
-# T6 owns the authoritative schema list in ``tools.py`` and must derive this set from
-# it rather than keep a second copy.
-_MEMORY_TOOL_NAMES = frozenset(
-    {
-        "mem_search",
-        "mem_save",
-        "mem_update",
-        "mem_get_observation",
-        "mem_context",
-        "mem_session_summary",
-        "mem_timeline",
-    }
-)
+# Derived from the authoritative schema list in ``tools.py``, never a second copy.
+_MEMORY_TOOL_NAMES = tools_module.TOOL_NAMES
 
 # Hermes core already gave its own background executor a 5s FIFO drain before it
 # calls provider ``shutdown()``, and the user is waiting on process exit by then.
@@ -319,6 +310,11 @@ class RecallProvider(MemoryProvider):
             # every context (reading is harmless and useful); every write path in
             # this and later tasks must check this flag.
             self._writes_enabled = self._agent_context == "primary"
+
+            # The /recall slash command is registered once, at load time, while
+            # the agent may construct and initialize a different instance later.
+            # The command reports on the instance that actually runs the session.
+            _set_active_provider(self)
 
             if not self._config.enabled:
                 return
@@ -1143,12 +1139,75 @@ class RecallProvider(MemoryProvider):
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        """Return this provider's tool schemas — empty until T6 fills it from ``tools.py``.
+        """Return the ten ``mem_*`` schemas, or ``[]`` when recall is disabled.
 
         Cheap, pure and side-effect free: the host calls it at least three times
         during registration alone (conflict check, routing table, log line).
         """
-        return []
+        try:
+            if not self._config.enabled:
+                return []
+            return tools_module.get_tool_schemas()
+        except Exception:
+            return []
+
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        """Run one ``mem_*`` tool and return its JSON result. Never raises.
+
+        ``**kwargs`` is accepted and ignored: the host forwards whatever context it
+        has, and nothing in it is needed to talk to Engram.
+        """
+        try:
+            if not self._config.enabled:
+                return tools_module.error_result("recall is disabled by configuration")
+            env = tools_module.ToolEnv(
+                client=self._client,
+                session_id=self._session_id,
+                hermes_home=resolve_hermes_home(self._hermes_home),
+                writes_enabled=self._writes_enabled,
+                agent_context=self._agent_context,
+                resolve_project=self._ensure_project,
+                register_session=self._register_session_now,
+            )
+            return tools_module.handle_tool_call(env, tool_name, args)
+        except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
+            logger.debug("recall handle_tool_call failed (non-fatal)", exc_info=True)
+            return tools_module.error_result(f"{tool_name} failed: {type(exc).__name__}")
+
+    def _register_session_now(self, project: str) -> bool:
+        """Register the current session synchronously (tool thread). Idempotent server-side."""
+        if not self._writes_enabled or not self._session_id:
+            return False
+        target = project or self._ensure_project()
+        if not target:
+            return False
+        created = self._client.create_session(
+            self._session_id, target, directory=_working_directory()
+        )
+        return created is not None
+
+    # -- Slash command -------------------------------------------------------
+
+    def recall_command(self, raw_args: str = "") -> str:
+        """Handler for ``/recall [id]``: status, or one observation's detail. Never raises.
+
+        Plain text, no LLM. Delegates to the instance that ``initialize`` ran on when
+        there is one, since the command is registered before the agent builds its
+        own provider instance.
+        """
+        try:
+            target = _get_active_provider() or self
+            argument = raw_args.strip() if isinstance(raw_args, str) else ""
+            if argument:
+                return tools_module.observation_report(target._client, argument)
+            return tools_module.status_report(
+                target._client,
+                resolve_hermes_home(target._hermes_home),
+                project=target._project,
+                recall_count=target._last_recall_count if target._session_id else None,
+            )
+        except Exception:
+            return "🧠 Recall — status unavailable"
 
     # -- Internals -----------------------------------------------------------
 
@@ -1163,6 +1222,20 @@ class RecallProvider(MemoryProvider):
         """
         candidate = session_id.strip() if isinstance(session_id, str) else ""
         return candidate or self._session_id
+
+
+_active_provider: weakref.ref[RecallProvider] | None = None
+
+
+def _set_active_provider(provider: RecallProvider) -> None:
+    """Remember the most recently initialized provider (weakly, so it can be collected)."""
+    global _active_provider
+    _active_provider = weakref.ref(provider)
+
+
+def _get_active_provider() -> RecallProvider | None:
+    """Return the most recently initialized provider, if it is still alive."""
+    return _active_provider() if _active_provider is not None else None
 
 
 def _normalize_query(query: str) -> str:

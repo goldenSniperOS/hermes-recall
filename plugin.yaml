@@ -35,4 +35,14 @@ config_schema:
     type: bool
     default: true
     description: "Set false to disable recall and capture without uninstalling the plugin."
-provides_tools: [mem_search, mem_save, mem_update, mem_get_observation, mem_context, mem_session_summary, mem_timeline]
+provides_tools:
+  - mem_search
+  - mem_save
+  - mem_update
+  - mem_get_observation
+  - mem_context
+  - mem_session_summary
+  - mem_timeline
+  - mem_judge
+  - mem_pin
+  - mem_unpin

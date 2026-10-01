@@ -96,3 +96,26 @@ def test_register_is_callable_and_reexported_by_root_init() -> None:
     assert "from .hermes_recall import __version__, register" in ROOT_INIT
     assert "from hermes_recall import __version__, register" in ROOT_INIT
     assert '__all__ = ["__version__", "register"]' in ROOT_INIT
+
+
+def test_manifest_provides_tools_matches_the_tool_schemas() -> None:
+    from hermes_recall.tools import get_tool_schemas
+
+    lines = MANIFEST.splitlines()
+    assert "provides_tools:" in lines, "plugin.yaml has no block-style provides_tools list"
+    listed: list[str] = []
+    for line in lines[lines.index("provides_tools:") + 1 :]:
+        item = re.fullmatch(r"\s+-\s*(\S+)\s*", line)
+        if not item:
+            break
+        listed.append(item.group(1))
+    assert listed == [schema["name"] for schema in get_tool_schemas()]
+    assert len(listed) == 10
+
+
+def test_root_cli_exposes_the_loader_hooks() -> None:
+    # discover_plugin_cli_commands reads <provider dir>/cli.py, calls
+    # register_cli(subparser) and resolves the handler as `<name>_command`.
+    source = (REPO_ROOT / "cli.py").read_text(encoding="utf-8")
+    assert "def register_cli(subparser" in source
+    assert "def recall_command(args" in source

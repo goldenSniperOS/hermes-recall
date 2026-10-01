@@ -948,14 +948,17 @@ def test_drain_for_test_returns_true_on_an_idle_provider() -> None:
 # -- 10. tools ----------------------------------------------------------------
 
 
-def test_get_tool_schemas_is_empty_and_pure() -> None:
+def test_get_tool_schemas_is_stable_and_pure() -> None:
     provider = RecallProvider(config=make_config("http://127.0.0.1:1"))
 
     first = provider.get_tool_schemas()
     second = provider.get_tool_schemas()
 
-    assert first == []
+    assert len(first) == 10
     assert first == second
+    # A fresh copy each call: mutating one result must not leak into the next.
+    first[0]["name"] = "mutated"
+    assert provider.get_tool_schemas()[0]["name"] == "mem_search"
 
 
 def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
@@ -964,23 +967,17 @@ def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
     provider = RecallProvider(config=make_config(fake_engram.base_url))
 
     for _ in range(3):
-        assert provider.get_tool_schemas() == []
+        assert len(provider.get_tool_schemas()) == 10
 
     assert fake_engram.requests == []
 
 
-# -- 11. inherited hooks stay inherited ---------------------------------------
+def test_get_tool_schemas_is_empty_when_disabled() -> None:
+    provider = RecallProvider(config=make_config("http://127.0.0.1:1", enabled=False))
+    assert provider.get_tool_schemas() == []
 
 
-@pytest.mark.parametrize("hook", ["handle_tool_call"])
-def test_lifecycle_hooks_are_still_inherited(hook: str) -> None:
-    """T6 owns what is left; it must not be stubbed early with wrong behaviour.
-
-    ``on_turn_start``, ``sync_turn`` and ``on_delegation`` left this list in T4;
-    ``on_session_end``, ``on_session_switch`` and ``on_pre_compress`` left it in T5.
-    See tests/test_capture.py and tests/test_lifecycle.py.
-    """
-    assert hook not in vars(RecallProvider), f"{hook} was implemented early"
+# -- 11. every hook is a real override ----------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -992,10 +989,12 @@ def test_lifecycle_hooks_are_still_inherited(hook: str) -> None:
         "on_session_end",
         "on_session_switch",
         "on_pre_compress",
+        "get_tool_schemas",
+        "handle_tool_call",
     ],
 )
 def test_capture_and_lifecycle_hooks_are_implemented(hook: str) -> None:
-    """The other half: every hook T4/T5 own must be a real override, not inherited."""
+    """Every hook T4-T6 own must be a real override, not the inherited default."""
     assert hook in vars(RecallProvider), f"{hook} is still the inherited no-op"
 
 

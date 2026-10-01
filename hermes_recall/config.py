@@ -159,3 +159,21 @@ def load_config() -> RecallConfig:
             enabled=True,
             auth_token="",
         )
+
+
+def resolve_hermes_home(explicit: str = "") -> str:
+    """Return the Hermes home directory: ``explicit``, else ``$HERMES_HOME``, else ``~/.hermes``.
+
+    ``explicit`` is the ``hermes_home`` kwarg Hermes passes to ``initialize`` (the
+    active profile's home). The fallbacks serve callers that have no provider
+    session — the ``hermes recall`` CLI — and never raise.
+    """
+    try:
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        env_home = os.environ.get("HERMES_HOME", "")
+        if env_home.strip():
+            return env_home.strip()
+        return os.path.join(os.path.expanduser("~"), ".hermes")
+    except Exception:
+        return os.path.join("~", ".hermes")

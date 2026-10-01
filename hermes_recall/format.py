@@ -158,6 +158,59 @@ def updated_status(observation_id: Any) -> str:
     return f"🧠 updated #{observation_id}"
 
 
+def observation_status(observation_id: Any) -> str:
+    """Render the read confirmation for a fetched observation."""
+    return f"🧠 observation #{observation_id}"
+
+
+def pinned_status(observation_id: Any) -> str:
+    """Render the confirmation for a pinned observation."""
+    return f"🧠 pinned #{observation_id}"
+
+
+def unpinned_status(observation_id: Any) -> str:
+    """Render the confirmation for an unpinned observation."""
+    return f"🧠 unpinned #{observation_id}"
+
+
+# Content ceiling of the ``/recall <id>`` and ``hermes recall show <id>`` detail view.
+DETAIL_CONTENT_MAX_CHARS = 800
+
+
+def render_observation_detail(
+    observation: Any, *, max_chars: int = DETAIL_CONTENT_MAX_CHARS, error: str = ""
+) -> str:
+    """Render one observation for a human: id, title, type, created_at and content.
+
+    Plain text for the ``/recall <id>`` slash command and the CLI. The content keeps
+    its line breaks (it is read by a person, not packed into a prompt) and is cut at
+    ``max_chars`` with ``…``. A missing observation renders a one-line notice that
+    carries ``error`` when the caller has one.
+    """
+    try:
+        if not isinstance(observation, dict) or not _hit_id(observation.get("id")):
+            detail = f" ({error.strip()})" if isinstance(error, str) and error.strip() else ""
+            return f"🧠 Recall — observation not available{detail}"
+        identifier = _hit_id(observation.get("id"))
+        content = observation.get("content")
+        text = content.strip() if isinstance(content, str) else ""
+        limit = max_chars if isinstance(max_chars, int) and max_chars > 0 else 0
+        if len(text) > limit:
+            text = text[: max(0, limit - 1)].rstrip() + "\u2026"
+        lines = [
+            f"🧠 observation #{identifier}",
+            f"  title:    {_or_unknown(observation.get('title'))}",
+            f"  type:     {_or_unknown(observation.get('type'))}",
+            f"  project:  {_or_unknown(observation.get('project'))}",
+            f"  created:  {_or_unknown(observation.get('created_at'))}",
+            "",
+            text or UNKNOWN,
+        ]
+        return "\n".join(lines)
+    except Exception:
+        return "🧠 Recall — observation not available"
+
+
 # -- internals ----------------------------------------------------------------
 
 
