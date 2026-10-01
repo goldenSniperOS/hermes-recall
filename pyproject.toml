@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-recall"
+version = "0.1.0"
+description = "Hermes Agent memory provider: Engram-compatible recall, capture and session lifecycle."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Adrian Ruiz" }]
+keywords = ["hermes-agent", "plugin", "memory", "engram", "recall"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.6,<1"]
+
+[project.urls]
+Homepage = "https://github.com/goldenSniperOS/hermes-recall"
+Issues = "https://github.com/goldenSniperOS/hermes-recall/issues"
+Changelog = "https://github.com/goldenSniperOS/hermes-recall/blob/main/CHANGELOG.md"
+
+# Memory providers have their own entry-point group, separate from the general
+# ``hermes_agent.plugins`` one: the memory loader only scans this group (see
+# ``ENTRY_POINTS_GROUP`` in ``plugins/memory/__init__.py``). The entry-point name
+# is the provider name, so it must match the git-clone install directory.
+[project.entry-points."hermes_agent.memory_providers"]
+recall = "hermes_recall:register"
+
+[tool.setuptools]
+packages = ["hermes_recall"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,38 @@
+name: recall
+version: 0.1.0
+manifest_version: 1
+kind: exclusive
+description: >-
+  Engram-compatible memory provider for Hermes Agent: deterministic recall before
+  every turn, passive capture after it, session lifecycle and compaction recovery
+  against a local Engram HTTP server. Independent community project; not
+  affiliated with or endorsed by Engram or Gentleman Programming.
+author: goldenSniperOS
+license: MIT
+homepage: https://github.com/goldenSniperOS/hermes-recall
+tags: [memory, engram, recall, gentle-ai-compatible]
+# Settings live under memory.recall.* in the Hermes config.yaml, the block the
+# memory provider reads for a directory install and for a pip install alike.
+# The provider is selected by name with memory.provider: recall.
+config_schema:
+  url:
+    type: str
+    default: http://127.0.0.1:7437
+    description: "Base URL of the local Engram HTTP server (engram serve). The ENGRAM_URL environment variable wins over this value."
+  project:
+    type: str
+    default: ""
+    description: "Override the auto-detected Engram project. Empty means the project Engram reports for the working directory."
+  recall_limit:
+    type: int
+    default: 5
+    description: "Maximum number of Engram search hits injected into a turn."
+  recall_max_chars:
+    type: int
+    default: 2500
+    description: "Upper bound on the total characters of the injected recall block."
+  enabled:
+    type: bool
+    default: true
+    description: "Set false to disable recall and capture without uninstalling the plugin."
+provides_tools: [mem_search, mem_save, mem_update, mem_get_observation, mem_context, mem_session_summary, mem_timeline]
