@@ -37,7 +37,8 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
 
 ## Non-goals
 
-- Starting/owning the Engram server process lifecycle beyond a health check.
+- Stopping or replacing an Engram server the provider did not verify (it adopts a
+  healthy server with a matching instance id and never kills one).
 - Engram Cloud auth flows.
 - Any change to Hermes core.
 
@@ -63,9 +64,17 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
       recovery context). Route: delegated.
 - [x] T6 Tools: compact mem_* schemas + handle_tool_call; 🧠 saved #id status; last id
       state file. Route: delegated.
-- [ ] T7 Docs + credits + install prompt; real install in throwaway HERMES_HOME; v0.1.0
+- [x] T7 Docs + credits + install prompt; real install in throwaway HERMES_HOME; v0.1.0
       release; public repo. Route: inline.
-- [ ] T8 hermes-odd v0.7.0: doctor detects provider, status shows last memory id,
+- [ ] T9 v0.2.0 Engram server auto-start, parity with gentle-engram: adopt a healthy
+      server with matching instance id, spawn a detached `engram serve` when none
+      answers (default loopback URL, ENGRAM_URL unset, primary context only), one
+      bounded restart, cross-process lock, `memory.recall.autostart`, never kill.
+      Route: delegated (Pi gentle-ai-worker), then verify + native review.
+- [ ] T10 Live install on the owner's Hermes (authorized): hermes-recall v0.2.0,
+      `memory.provider recall`, keep the Engram MCP for now, hermes-odd v0.7.0;
+      owner sends /restart. Route: inline.
+- [x] T8 (owned by the hermes-odd session) hermes-odd v0.7.0: doctor detects provider, status shows last memory id,
       install prompt covers hermes-recall, memory pointer adapts. Route: delegated.
 
 ## Acceptance criteria
@@ -126,7 +135,5 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 
 ## Next step
 
-Release v0.1.1, re-check the GitHub install in a throwaway home, then the live
-profile install (owner approval for memory.provider). Follow-ups for v0.2:
-review advisories (pre-registration doubling outage cost, delegation non-str
-guard, pip-install CLI gap). T8 is owned by the hermes-odd session.
+T9 auto-start (v0.2.0), then T10 live install. Remaining v0.2 follow-ups:
+pre-registration doubling outage cost, delegation non-str guard, pip-install CLI gap.

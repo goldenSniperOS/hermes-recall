@@ -118,6 +118,8 @@ def render_status_line(
     last_action: str = "",
     recall_count: int | None = None,
     url: str = "",
+    server_origin: str = "",
+    server_reason: str = "",
 ) -> str:
     """Render the human-facing recall status block (``hermes recall status``, ``/recall``).
 
@@ -127,12 +129,17 @@ def render_status_line(
 
     ``url`` is optional and additive: the health verdict is meaningful on its own,
     but when the caller knows which server it probed it belongs on the line.
+
+    ``server_origin`` is the auto-start outcome (``started``, ``adopted``,
+    ``foreign``, ``external``, ``disabled``, ``unavailable``; see ``server.py``) and
+    ``server_reason`` its human reason. Both are optional: without an origin the line
+    reads exactly as it did before auto-start existed.
     """
     try:
         lines = [
             "🧠 Recall — Engram memory provider",
             f"  project:      {_or_unknown(project)}",
-            f"  server:       {_server_verdict(url, server_ok)}",
+            f"  server:       {_server_verdict(url, server_ok, server_origin, server_reason)}",
             f"  last error:   {_or_unknown(last_error)}",
             f"  last memory:  {_memory_label(last_memory_id)}",
             f"  last action:  {_or_unknown(last_action)}",
@@ -285,9 +292,41 @@ def _or_unknown(value: Any) -> str:
     return UNKNOWN
 
 
-def _server_verdict(url: str, server_ok: bool) -> str:
-    """Render the server health verdict, prefixed with the URL when one is known."""
-    verdict = "reachable" if server_ok else "unreachable"
+# How the server was obtained, appended to "reachable" (keys mirror server.py).
+_ORIGIN_LABELS = {
+    "started": "started by recall",
+    "adopted": "adopted",
+    "external": "externally managed",
+    "disabled": "autostart off",
+}
+
+
+def _server_verdict(url: str, server_ok: bool, origin: str = "", reason: str = "") -> str:
+    """Render the server health verdict, prefixed with the URL when one is known.
+
+    Reachability is the live probe; the origin is how recall obtained the server.
+    A server that is down after a failed start says why (``not running — <reason>``).
+    """
+    origin = origin.strip() if isinstance(origin, str) else ""
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if server_ok:
+        if origin == "foreign":
+            # A definite identity mismatch: the provider sends it no memory.
+            verdict = (
+                f"reachable, foreign instance — not used: {reason}"
+                if reason
+                else "reachable, foreign instance — not used"
+            )
+        elif origin == "unavailable":
+            verdict = f"reachable, not verified — {reason}" if reason else "reachable, not verified"
+        elif origin in _ORIGIN_LABELS:
+            verdict = f"reachable, {_ORIGIN_LABELS[origin]}"
+        else:
+            verdict = "reachable"
+    elif origin == "unavailable":
+        verdict = f"not running — {reason}" if reason else "not running"
+    else:
+        verdict = "unreachable"
     cleaned = url.strip() if isinstance(url, str) else ""
     return f"{cleaned} ({verdict})" if cleaned else verdict
 

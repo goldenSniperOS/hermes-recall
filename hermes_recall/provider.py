@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import client as client_module
+from . import server as server_module
 from . import tools as tools_module
 from ._hermes import MemoryProvider, RecallStatus, is_trivial_prompt
 from .client import EngramClient
@@ -251,6 +252,18 @@ class RecallProvider(MemoryProvider):
         self._worker_lock = threading.Lock()
         self._shutting_down = False
 
+        # Engram server lifecycle (server.py). ``None`` until the primary context's
+        # ensure_server job has run. The restart flag makes the "one bounded restart
+        # per provider instance" rule a single check-and-set under the worker lock.
+        self._server_status: server_module.ServerStatus | None = None
+        self._server_restart_used = False
+        try:
+            setter = getattr(self._client, "set_refusal_listener", None)
+            if callable(setter):
+                setter(self._on_engram_refused)
+        except Exception:
+            logger.debug("recall: could not attach the refusal listener", exc_info=True)
+
     # -- Identity and availability -------------------------------------------
 
     @property
@@ -332,9 +345,71 @@ class RecallProvider(MemoryProvider):
             if not self._config.enabled:
                 return
 
+            # Only the primary agent may start Engram: a cron run, a subagent or a
+            # flush pass is a guest in the user's session, not its owner. Queued
+            # BEFORE registration on the same serialized worker, so registration
+            # meets a server that is up (or retries later via _registered_write).
+            # Never inline: initialize runs on the caller's thread.
+            if self._writes_enabled:
+                self._submit("ensure-server", self._ensure_server)
+
             self._submit("register-session", self._register_session)
         except Exception:
             logger.debug("recall initialize failed (non-fatal)", exc_info=True)
+
+    def _ensure_server(self) -> None:
+        """Adopt or start the local Engram server (worker thread). Never raises.
+
+        The server is shared with Pi and every other agent, so nothing here — and
+        nothing in :meth:`shutdown` — ever stops it.
+        """
+        try:
+            status = server_module.ensure_server(
+                self._config,
+                resolve_hermes_home(self._hermes_home),
+                client=self._client,
+                should_stop=lambda: self._shutting_down,
+            )
+            self._server_status = status
+            logger.debug("recall: engram server %s (%s)", status.status, status.reason)
+            server_module.write_server_state(resolve_hermes_home(self._hermes_home), status)
+        except Exception:
+            logger.debug("recall: ensure_server job failed (non-fatal)", exc_info=True)
+
+    def _foreign_reason(self) -> str:
+        """Why memory traffic is withheld, or ``""`` when it is not.
+
+        Non-empty only after ``ensure_server`` classified the server as ``foreign``:
+        ``/health`` reported an instance id that definitely differs from
+        ``ENGRAM_BIN instance-id``. Such a server is some other store, so for the
+        rest of this provider instance nothing is read from or written to it. A
+        server with *no* identity, or one whose identity could not be checked, is
+        still used (see ``docs/design.md``). Before classification nothing is gated.
+        """
+        status = self._server_status
+        if status is not None and status.status == server_module.FOREIGN:
+            return status.reason or "foreign Engram instance"
+        return ""
+
+    def _on_engram_refused(self) -> None:
+        """Client hook: Engram refused a connection. Schedules at most one restart.
+
+        Only for a server recall vouched for (adopted or started) and only once per
+        provider instance: a server that keeps dying must not turn every turn into a
+        spawn. Runs on whichever thread made the request, so it only enqueues.
+        """
+        try:
+            status = self._server_status
+            if status is None or not status.managed or not self._writes_enabled:
+                return
+            with self._worker_lock:
+                if self._server_restart_used or self._shutting_down:
+                    return
+                self._server_restart_used = True
+            logger.debug("recall: engram refused a connection; one restart attempt")
+            self._submit("restart-server", self._ensure_server)
+        except Exception:
+            logger.debug("recall: refusal handling failed (non-fatal)", exc_info=True)
 
     def _register_session(self) -> None:
         """Detect the project and register this session with Engram (worker thread)."""
@@ -361,6 +436,9 @@ class RecallProvider(MemoryProvider):
 
         Safe when the worker never started and safe to call twice. The join is
         short by design (:data:`SHUTDOWN_DRAIN_TIMEOUT_S`) — see that constant.
+
+        The Engram server is **never** stopped here, even when recall started it: it
+        is shared with Pi and every other agent using the same memory store.
         """
         try:
             with self._worker_lock:
@@ -447,6 +525,8 @@ class RecallProvider(MemoryProvider):
             override = str(self._config.project_override or "").strip()
             if override:
                 return override
+            if self._foreign_reason():
+                return ""
             payload = self._client.current_project(_working_directory())
             if not isinstance(payload, dict):
                 return ""
@@ -561,6 +641,8 @@ class RecallProvider(MemoryProvider):
         try:
             if not self._config.enabled:
                 return ""
+            if self._foreign_reason():
+                return ""
             # The host gates trivial prompts too (agent/turn_context.py), but the
             # provider must not depend on that: anything calling prefetch()
             # directly still has to get the same answer.
@@ -619,7 +701,7 @@ class RecallProvider(MemoryProvider):
                 return
             if is_trivial_prompt(query):
                 return
-            if self._project_detected:
+            if self._project_detected or self._foreign_reason():
                 return
             resolved_session = self._resolve_session_id(session_id)
 
@@ -934,6 +1016,9 @@ class RecallProvider(MemoryProvider):
             # the user had said it.
             logger.debug("recall: writes disabled for agent_context=%s", self._agent_context)
             return False
+        if self._foreign_reason():
+            logger.debug("recall: foreign Engram instance; not writing")
+            return False
         return bool(self._session_id)
 
     # -- Session lifecycle ---------------------------------------------------
@@ -1031,7 +1116,7 @@ class RecallProvider(MemoryProvider):
         """
         if not previous_session_id or previous_session_id == new_session_id:
             return
-        if not self._writes_enabled or not self._config.enabled:
+        if not self._writes_enabled or not self._config.enabled or self._foreign_reason():
             return
         if previous_session_id in self._ended_sessions:
             logger.debug("recall: session %s already ended; not ending twice", previous_session_id)
@@ -1188,6 +1273,11 @@ class RecallProvider(MemoryProvider):
         try:
             if not self._config.enabled:
                 return tools_module.error_result("recall is disabled by configuration")
+            foreign = self._foreign_reason()
+            if foreign:
+                return tools_module.error_result(
+                    f"Engram server not used (foreign instance): {foreign}"
+                )
             env = tools_module.ToolEnv(
                 client=self._client,
                 session_id=self._session_id,
@@ -1211,7 +1301,7 @@ class RecallProvider(MemoryProvider):
         may have happened since the job that asked was queued.
         """
         target_session = session_id or self._session_id
-        if not self._writes_enabled or not target_session:
+        if not self._writes_enabled or not target_session or self._foreign_reason():
             return False
         target = project or self._ensure_project()
         if not target:
@@ -1273,12 +1363,16 @@ class RecallProvider(MemoryProvider):
             target = _get_active_provider() or self
             argument = raw_args.strip() if isinstance(raw_args, str) else ""
             if argument:
+                foreign = target._foreign_reason()
+                if foreign:
+                    return f"🧠 Recall — Engram server not used (foreign instance): {foreign}"
                 return tools_module.observation_report(target._client, argument)
             return tools_module.status_report(
                 target._client,
                 resolve_hermes_home(target._hermes_home),
                 project=target._project,
                 recall_count=target._last_recall_count if target._session_id else None,
+                server_status=target._server_status,
             )
         except Exception:
             return "🧠 Recall — status unavailable"

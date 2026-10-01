@@ -43,14 +43,15 @@ way around.
 ## Requirements
 
 - Hermes Agent with memory-provider plugin support (tested with v0.21.0).
-- The Engram binary, with its HTTP server running:
+- The Engram binary, on `PATH` or pointed to by `ENGRAM_BIN`:
 
   ```bash
   brew install gentleman-programming/tap/engram
-  engram serve        # default http://127.0.0.1:7437
   ```
 
-  Tested with Engram 2.0.0.
+  Tested with Engram 2.0.0. You no longer need to start `engram serve` by
+  hand: when no server answers, hermes-recall starts one for you (see
+  [Engram server](#engram-server)).
 
 ## Install
 
@@ -121,6 +122,40 @@ back to it:
 
 Subagents, cron jobs and memory flushes read memory but never write it.
 
+### Engram server
+
+When a session starts, the primary agent checks the local Engram server, the
+same way gentle-engram does in Pi:
+
+- A server already answering with the same instance id as your `engram`
+  binary is used as is (`adopted`).
+- With nothing answering, it runs `engram serve` in the background, fully
+  detached, and waits up to 5 seconds for it (`started by recall`). Output
+  goes to `<hermes_home>/recall/engram-serve.log`.
+- A server that reports a different instance id is a different Engram, so
+  recall sends it no memory at all: no recall, no capture, and the memory
+  tools return an error (`foreign instance — not used: <reason>`).
+- A server with no instance id (an older Engram), or one whose identity
+  cannot be checked because the binary is not on `PATH`, is still used but
+  never managed (`reachable, not verified — <reason>`).
+- Nothing is ever stopped.
+- If a server recall adopted or started stops answering, recall tries one
+  restart per provider instance, never more.
+
+It never starts a server when `ENGRAM_URL` is set (you manage it), when
+`memory.recall.url` is not the address a plain `engram serve` binds
+(`http://127.0.0.1:7437`, or `http://127.0.0.1:<ENGRAM_PORT>`), when
+`memory.recall.autostart` is `false`, or from subagents, cron jobs and
+memory flushes. A lock file (`<hermes_home>/recall/serve.lock`) keeps a
+gateway and a CLI session from starting it twice.
+
+Recall never stops the server, not even on exit: it is shared with Pi and
+every other agent using the same memory. Stop it yourself if you want to.
+
+`hermes recall status` and `/recall` show how the server was obtained, for
+example `server: http://127.0.0.1:7437 (reachable, started by recall)` or
+`(not running — Engram binary "engram" not found; install Engram or set ENGRAM_BIN)`.
+
 ### Limitations
 
 - Hermes gives memory providers one native status line, the recall line.
@@ -136,11 +171,12 @@ All settings are optional:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `memory.recall.url` | `http://127.0.0.1:7437` | Engram HTTP server. The `ENGRAM_URL` environment variable wins. |
+| `memory.recall.url` | `http://127.0.0.1:7437` | Engram HTTP server. The `ENGRAM_URL` environment variable wins. When neither is set, the port follows `ENGRAM_PORT` (`http://127.0.0.1:<ENGRAM_PORT>`), like gentle-engram. |
 | `memory.recall.project` | auto | Engram project. Empty means the project Engram detects for the working directory. |
 | `memory.recall.recall_limit` | `5` | Search hits injected per turn (1-20). |
 | `memory.recall.recall_max_chars` | `2500` | Cap on the injected recall block. |
 | `memory.recall.enabled` | `true` | `false` turns recall, capture and tools off without uninstalling. |
+| `memory.recall.autostart` | `true` | Start `engram serve` when no server answers. `false` never starts one. Ignored when `ENGRAM_URL` is set. |
 
 ```bash
 hermes config set memory.recall.recall_limit 8

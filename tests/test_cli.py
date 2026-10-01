@@ -159,7 +159,9 @@ def test_recall_status_shows_project_health_last_id_and_recall_count(
 
     assert fake_engram.find("GET", "/health") is not None
     assert f"project:      {PROJECT}" in text
-    assert f"server:       {fake_engram.base_url} (reachable)" in text
+    # The fake listens on a port `engram serve` would not bind, so recall records
+    # the server as externally managed rather than started or adopted.
+    assert f"server:       {fake_engram.base_url} (reachable, externally managed)" in text
     assert "last memory:  #761" in text
     assert "last action:  saved" in text
     assert "last recall:  1 memory" in text

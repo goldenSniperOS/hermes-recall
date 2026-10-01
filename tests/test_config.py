@@ -50,6 +50,7 @@ def clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove both environment variables the config reads."""
     monkeypatch.delenv(ENV_URL, raising=False)
     monkeypatch.delenv(ENV_TOKEN, raising=False)
+    monkeypatch.delenv("ENGRAM_PORT", raising=False)
 
 
 # -- url ---------------------------------------------------------------------
@@ -107,6 +108,36 @@ def test_blank_env_and_blank_config_url_fall_back_to_default(
     assert load_config().url == DEFAULT_URL
 
 
+def test_default_url_follows_engram_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    # gentle-engram: `http://127.0.0.1:${ENGRAM_PORT ?? 7437}` (index.ts:24-26).
+    clear_env(monkeypatch)
+    monkeypatch.setenv("ENGRAM_PORT", "8123")
+    stub_hermes_config(monkeypatch, {})
+
+    assert load_config().url == "http://127.0.0.1:8123"
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "0", "70000"])
+def test_invalid_engram_port_keeps_the_7437_default(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    clear_env(monkeypatch)
+    monkeypatch.setenv("ENGRAM_PORT", raw)
+    stub_hermes_config(monkeypatch, {})
+
+    assert load_config().url == DEFAULT_URL
+
+
+def test_explicit_urls_win_over_engram_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_env(monkeypatch)
+    monkeypatch.setenv("ENGRAM_PORT", "8123")
+    stub_hermes_config(monkeypatch, {"url": "http://config-host:1234"})
+    assert load_config().url == "http://config-host:1234"
+
+    monkeypatch.setenv(ENV_URL, "http://env-host:999")
+    assert load_config().url == "http://env-host:999"
+
+
 def test_config_url_used_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_env(monkeypatch)
     stub_hermes_config(monkeypatch, {"url": "http://config-host:1234"})
@@ -126,6 +157,7 @@ def test_defaults_when_neither_env_nor_config_is_set(monkeypatch: pytest.MonkeyP
         recall_max_chars=DEFAULT_RECALL_MAX_CHARS,
         enabled=True,
         auth_token="",
+        autostart=True,
     )
 
 
@@ -220,6 +252,37 @@ def test_enabled_coercion(monkeypatch: pytest.MonkeyPatch, raw: Any, expected: b
     stub_hermes_config(monkeypatch, {"enabled": raw})
 
     assert load_config().enabled is expected
+
+
+# -- autostart ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("false", False),
+        ("off", False),
+        ("yes", True),
+        ("maybe", True),  # unrecognised -> default True
+        (None, True),  # absent -> default True
+    ],
+)
+def test_autostart_coercion(monkeypatch: pytest.MonkeyPatch, raw: Any, expected: bool) -> None:
+    clear_env(monkeypatch)
+    stub_hermes_config(monkeypatch, {"autostart": raw} if raw is not None else {})
+
+    assert load_config().autostart is expected
+
+
+def test_autostart_is_independent_of_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_env(monkeypatch)
+    stub_hermes_config(monkeypatch, {"enabled": True, "autostart": False})
+
+    config = load_config()
+    assert config.enabled is True
+    assert config.autostart is False
 
 
 # -- project_override ---------------------------------------------------------

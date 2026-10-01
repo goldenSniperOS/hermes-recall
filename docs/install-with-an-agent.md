@@ -10,7 +10,7 @@ applies to it:
 
 | Starting point | What changes for you |
 |---|---|
-| **A. No Engram** (the `engram` binary is missing) | The agent installs Engram, starts `engram serve`, installs the plugin and selects it as the memory provider. |
+| **A. No Engram** (the `engram` binary is missing) | The agent installs Engram, installs the plugin and selects it as the memory provider. hermes-recall starts `engram serve` by itself on the next session. |
 | **B. Engram already used by Hermes as an MCP server** (`hermes mcp list` shows `engram`) | Same as A without the binary install. The agent asks you whether to remove the Engram MCP server, since hermes-recall already provides the memory tools. Your other agents are not touched. |
 | **C. Another memory provider is active** (`hermes memory status` shows a provider other than `recall`) | Hermes runs one external memory provider at a time. Selecting `recall` replaces the current one, so the agent asks you before switching. Nothing is deleted: you can switch back with `hermes config set memory.provider <old name>`. |
 
@@ -47,13 +47,16 @@ STEP 0 - Detect the starting point and tell me which one applies:
   A = no Engram. B = Engram registered as MCP for Hermes.
   C = another memory provider is active (can combine with B).
 
-STEP 1 - Engram binary and server:
+STEP 1 - Engram binary (the server is started automatically):
   If missing: brew install gentleman-programming/tap/engram
   If present: brew upgrade gentleman-programming/tap/engram
   If Homebrew is missing, stop and tell me.
-  Check the server: curl -s http://127.0.0.1:7437/health
-  If it does not answer, start it with `engram serve` in the background (or
-  ask me how I keep it running: launchd, systemd, a terminal) and check again.
+  Check the binary: `engram instance-id` prints a 32-character id.
+  You do not need to start the server: hermes-recall starts `engram serve`
+  by itself when the new session begins (STEP 5) and nothing answers.
+  Only if `hermes recall status` later shows "not running", start it by
+  hand with `engram serve` in the background as a fallback (or ask me how I
+  keep it running: launchd, systemd, a terminal) and check again.
 
 STEP 2 - Plugin:
   New install:       hermes plugins install goldenSniperOS/hermes-recall

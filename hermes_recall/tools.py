@@ -30,6 +30,7 @@ from .format import (
     updated_status,
 )
 from .redact import strip_private, truncate
+from .server import read_server_state
 from .state import read_state, write_state
 
 logger = logging.getLogger(__name__)
@@ -603,10 +604,18 @@ def status_report(
     *,
     project: str = "",
     recall_count: int | None = None,
+    server_status: Any = None,
 ) -> str:
-    """Probe Engram health and render the shared plain-text status block. Never raises."""
+    """Probe Engram health and render the shared plain-text status block. Never raises.
+
+    ``server_status`` is the in-process auto-start outcome (a ``ServerStatus``); when
+    it is ``None`` the outcome recorded in ``<hermes_home>/recall/server.json`` is
+    used, which is how ``hermes recall status`` — a separate process — knows whether
+    recall started the server.
+    """
     try:
         state = read_state(hermes_home)
+        lifecycle = server_status if server_status is not None else read_server_state(hermes_home)
         health = client.health()
         server_ok = isinstance(health, dict) and health.get("status") == "ok"
         last_error = "" if server_ok else (client.last_error_text() or "unexpected /health reply")
@@ -618,6 +627,8 @@ def status_report(
             last_action=state.get("last_action", ""),
             recall_count=recall_count,
             url=client.base_url,
+            server_origin=getattr(lifecycle, "status", "") or "",
+            server_reason=getattr(lifecycle, "reason", "") or "",
         )
     except Exception:
         return "🧠 Recall — status unavailable"

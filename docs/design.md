@@ -2,7 +2,7 @@
 
 `hermes-recall` is an exclusive Hermes Agent memory provider (`memory.provider: recall`)
 that makes a local Engram HTTP server (`engram serve`, default
-`http://127.0.0.1:7437`) the agent's memory. Runtime is Python stdlib only.
+`http://127.0.0.1:7437`, or the `ENGRAM_PORT` port) the agent's memory. Runtime is Python stdlib only.
 
 ## Architecture
 
@@ -22,6 +22,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `hermes_recall/state.py` | The stable `state.json` contract (`read_state`, `write_state`) |
 | `hermes_recall/format.py` | Pure rendering: recall block, status block, observation detail, `🧠` status strings |
 | `hermes_recall/config.py` | Settings (`ENGRAM_URL` > `memory.recall.*` > defaults), Hermes home resolution |
+| `hermes_recall/server.py` | Engram server lifecycle: adopt a verified server or start a detached `engram serve`; `server.json` |
 | `__init__.py` (root) | Loader entry point; re-exports `register(ctx)` |
 | `cli.py` (root) | `hermes recall status` / `hermes recall show <id>` |
 
@@ -29,7 +30,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 
 | Hermes surface | Engram endpoint | Notes |
 | --- | --- | --- |
-| `initialize` | `GET /project/current?cwd=`, `POST /sessions` | Background; primary context only; retried by later writes if it fails |
+| `initialize` | `GET /health` (+ `engram instance-id`, maybe `engram serve`), `GET /project/current?cwd=`, `POST /sessions` | Background; primary context only; server ensured before registration; registration retried by later writes if it fails |
 | `prefetch` | `GET /search`, `GET /context` (once per session) | Trivial prompts skipped; 4 s budget |
 | `queue_prefetch` | `GET /project/current` (until detected) | Warms project detection only; no search, never consumes the `/context` flag |
 | `recall_status` | — | `🧠 Recall · <project> — recalled N memories`, rendered by Hermes |
@@ -73,6 +74,120 @@ is renamed `engram_status`). When the response carries judgment data
 gets a `next_step` hint telling the model to call `mem_judge`. Engram 2.0's HTTP
 `POST /observations` (`handleAddObservation`, `server.go`) answers only
 `{"id", "status"}` today, so this is forward compatibility, not a current path.
+
+## Engram server lifecycle
+
+Ported from gentle-engram's `initializeEngramServer` (`index.ts`), so Hermes and Pi
+share one server under the same rules. `server.ensure_server()` runs once on the
+background worker from the primary context's `initialize`, queued **before** session
+registration on the same serialized worker. `initialize` returns at once, and
+`prefetch` keeps its own bounded path, so the first turn never waits for a start.
+
+### Decision table
+
+Checked in this order; the first matching row decides.
+
+| Condition | Status | Action |
+| --- | --- | --- |
+| `ENGRAM_URL` set in the environment | `external` | none: externally managed |
+| `memory.recall.autostart: false` | `disabled` | none |
+| URL is not `http://127.0.0.1:<port>` or `http://localhost:<port>` with `<port>` = `ENGRAM_PORT` or 7437, with no path (other than `/`), query or fragment | `external` | none: a spawned `engram serve` could not answer there |
+| `/health` ok, `instance_id` = `ENGRAM_BIN instance-id` | `adopted` | none |
+| `/health` ok, different `instance_id` | `foreign` | **no memory traffic** for this provider instance; never managed, never killed |
+| `/health` ok, no `instance_id` | `unavailable` | used, never managed: legacy (version < 2.0.0-rc.11) or identity missing (see the decision below) |
+| `/health` ok, `instance-id` cannot be resolved | `unavailable` | used, never managed: identity cannot be verified |
+| no answer, binary missing or `instance-id` fails | `unavailable` | none ("install Engram or set ENGRAM_BIN") |
+| no answer, start lock held by another process | `adopted` / `foreign` / `unavailable` | poll `/health` until the deadline, never spawn; classify whatever answers |
+| no answer, lock taken, provider shutting down | `unavailable` | none: no spawn after shutdown |
+| no answer, lock taken | `started` / `adopted` / `foreign` / `unavailable` | re-probe, spawn `ENGRAM_BIN serve`, poll `/health` until the deadline; `adopted` when a matching server answers but our child already exited (the port was taken) |
+
+### Decision: only a definite mismatch is gated
+
+When `/health` reports an `instance_id` that differs from `ENGRAM_BIN instance-id`,
+the server is provably a different Engram (another store). For the rest of that
+provider instance recall sends it **no memory traffic**: `prefetch` and
+`queue_prefetch` return nothing, project detection, session registration, prompt,
+passive and delegation capture, session end and the compaction archive are skipped,
+the `mem_*` tools and `/recall <id>` return an error naming the reason, and the
+status line reads `foreign instance — not used: <reason>`. Only the status probe
+(`GET /health`) still reaches it. Everything before classification is unchanged.
+
+This **diverges from gentle-engram** on purpose in the other direction: gentle-engram
+fails closed for a healthy server with no identity (legacy or identity missing) and
+for a binary that cannot resolve `instance-id`. recall still **uses** those servers
+and never manages them (`unavailable`, shown as `reachable, not verified —
+<reason>`, no restart). Reason: a gateway whose `PATH` lacks the `engram` binary, or
+a user still running an older Engram, must not silently lose memory. A mismatch is
+evidence of the wrong store; a missing identity is only missing evidence.
+
+Default URL: with neither `ENGRAM_URL` nor `memory.recall.url` set, the URL is
+`http://127.0.0.1:<ENGRAM_PORT or 7437>`, exactly gentle-engram's
+`CONFIGURED_ENGRAM_URL || http://127.0.0.1:${ENGRAM_PORT}` (`index.ts:24-26`), so the
+default always matches what a spawned `engram serve` binds.
+
+Why the port rule: Engram binds `fmt.Sprintf("127.0.0.1:%d", s.port)` (`server.go`
+`Start`), and the binary documents `ENGRAM_PORT  Override HTTP server port (default:
+7437)`. The child inherits our environment, so it binds exactly `127.0.0.1:<port>`.
+`[::1]` is not accepted because the server listens on IPv4 loopback only.
+
+### Bounds
+
+| Step | Bound |
+| --- | --- |
+| `ENGRAM_BIN instance-id` | 3 s (stdout only; the real binary prints an update notice on stderr) |
+| each `/health` probe | 0.5 s |
+| readiness polling after a spawn, or while another process holds the lock | 5 s total, every 0.1 s |
+
+### Spawn
+
+`ENGRAM_BIN` (else `engram` on `PATH`) is launched as exactly `[bin, "serve"]` with
+`start_new_session=True` (Windows: detached process group), `stdin` from `/dev/null`,
+stdout and stderr appended to `<hermes_home>/recall/engram-serve.log` (or discarded
+when it cannot be opened) and `close_fds=True`.
+
+- **Environment: inherited** from Hermes. `ENGRAM_PORT` and Engram's own data-dir
+  settings must reach the child, or it would bind another port or open another
+  store than the one recall (and Pi) talk to.
+- **cwd: `<hermes_home>/recall`**, not the Hermes process cwd, so a long-lived
+  server never holds a user repository as its working directory.
+- **Log cap:** before each spawn, a log over 1 MB is rotated to
+  `engram-serve.log.1` (replacing the previous one), then the new run appends.
+- **Reaping:** a daemon thread calls `wait()` on the child, so when the server
+  later exits on its own it never stays a zombie in a long-lived gateway. This
+  only collects the exit status; it never signals the process.
+
+### Cross-process lock
+
+An exclusive non-blocking `fcntl.flock` on `<hermes_home>/recall/serve.lock` wraps
+the re-probe, the spawn and the readiness wait, so a gateway and a CLI session
+cannot both spawn. A process that cannot take the lock only polls `/health` within
+the deadline. Without `fcntl` (Windows), or when the lock file cannot be opened,
+the start goes ahead without it.
+
+### One bounded restart
+
+The client fires a refusal listener on a TCP connection refusal only (not on a
+timeout or an HTTP error, which mean a server may be alive). When the status is
+`adopted` or `started`, the provider schedules one `ensure_server` on the worker.
+At most one per provider instance; never for `foreign`, `external` or `disabled`.
+
+### Never kill
+
+Nothing in recall stops a server: not a foreign one, not one that never became
+ready, not the one recall started, not at `shutdown`. The server is shared with Pi
+and every other agent on the machine. gentle-engram terminates a child it gave up
+on during startup; recall deliberately does not (a slow start may still finish and
+serve the next session).
+
+### Status
+
+The outcome is kept on the provider and written to `<hermes_home>/recall/server.json`
+(`status`, `reason`, `url`, `updated_at`), so `hermes recall status` in another process
+can show it. The `server:` line combines the live `/health` probe with the outcome:
+`reachable, started by recall`, `reachable, adopted`, `reachable, foreign instance —
+not used: <reason>`, `reachable, not verified — <reason>`, `reachable, externally
+managed`, `reachable, autostart off`, or `not running — <reason>`. Without a recorded outcome the line is just
+`reachable` / `unreachable`. `server.json` is internal, not a stable contract.
 
 ## `state.json` contract (stable)
 

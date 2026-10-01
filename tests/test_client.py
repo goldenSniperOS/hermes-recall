@@ -615,7 +615,7 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
 }
 
 # Public callables that are introspection, not HTTP, and so are not swept.
-NON_ENDPOINT_METHODS = frozenset({"last_error_text"})
+NON_ENDPOINT_METHODS = frozenset({"last_error_text", "set_refusal_listener"})
 
 
 def public_endpoint_methods() -> dict[str, Any]:
@@ -876,3 +876,49 @@ def test_a_loopback_request_bypasses_a_configured_proxy(
 
         assert client_for(fake_engram).health() == {"status": "ok"}
         assert proxy.requests == []
+
+
+# -- refusal listener (auto-start restart trigger) -------------------------------
+
+
+def test_refused_connection_notifies_the_refusal_listener() -> None:
+    client = EngramClient(make_config(f"http://127.0.0.1:{unused_port()}"))
+    seen: list[str] = []
+    client.set_refusal_listener(lambda: seen.append("refused"))
+
+    assert client.health() is None
+    assert client.search("anything", project="p") == []
+
+    assert seen == ["refused", "refused"]
+
+
+def test_http_errors_do_not_notify_the_refusal_listener(fake_engram: FakeEngram) -> None:
+    fake_engram.route("GET", "/health", (500, {"error": "boom"}))
+    client = client_for(fake_engram)
+    seen: list[str] = []
+    client.set_refusal_listener(lambda: seen.append("refused"))
+
+    assert client.health() is None
+
+    assert seen == []
+
+
+def test_a_failing_refusal_listener_never_escapes() -> None:
+    client = EngramClient(make_config(f"http://127.0.0.1:{unused_port()}"))
+
+    def boom() -> None:
+        raise RuntimeError("listener bug")
+
+    client.set_refusal_listener(boom)
+
+    assert client.health() is None
+    assert "unreachable" in client.last_error_text()
+
+
+def test_health_accepts_a_shorter_timeout(fake_engram: FakeEngram) -> None:
+    fake_engram.route("GET", "/health", Delay(0.5))
+    client = client_for(fake_engram)
+
+    started = time.monotonic()
+    assert client.health(timeout=0.1) is None
+    assert time.monotonic() - started < 0.45

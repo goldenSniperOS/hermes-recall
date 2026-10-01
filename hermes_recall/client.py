@@ -12,12 +12,14 @@ table in ``engram/server.go``.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 from .config import RecallConfig, load_config
@@ -67,6 +69,19 @@ class EngramClient:
         # the call.
         self._errors = threading.local()
         self._opener = _build_opener(self._base_url)
+        # Called (no arguments) whenever a request is refused at the TCP level: the
+        # provider's one bounded restart trigger. ``None`` means nobody listens.
+        self._refusal_listener: Callable[[], None] | None = None
+
+    def set_refusal_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register the callback fired when the server refuses a connection.
+
+        Only a refusal counts — proof that nothing listens on the port. A timeout or
+        an HTTP error means a server answered (or might have), and restarting over
+        either could fight a live server. The callback runs on the requesting
+        thread, so it must be cheap; its exceptions are swallowed.
+        """
+        self._refusal_listener = listener
 
     # -- Introspection -------------------------------------------------------
 
@@ -158,12 +173,16 @@ class EngramClient:
             return None
         except urllib.error.URLError as exc:
             self._record_error(f"{method} {path}: unreachable ({exc.reason})")
+            if _is_connection_refused(exc.reason):
+                self._notify_refused()
             return None
         except TimeoutError:
             self._record_error(f"{method} {path}: {TIMEOUT_ERROR_MARKER} after {timeout:g}s")
             return None
         except OSError as exc:
             self._record_error(f"{method} {path}: OS error ({exc})")
+            if _is_connection_refused(exc):
+                self._notify_refused()
             return None
         except json.JSONDecodeError as exc:
             self._record_error(f"{method} {path}: malformed JSON ({exc.msg})")
@@ -172,11 +191,25 @@ class EngramClient:
             self._record_error(f"{method} {path}: unexpected {type(exc).__name__}")
             return None
 
+    def _notify_refused(self) -> None:
+        """Fire the refusal listener, never letting it raise into a request."""
+        listener = self._refusal_listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception:
+            logger.debug("engram client: refusal listener failed", exc_info=True)
+
     # -- Health and project --------------------------------------------------
 
-    def health(self) -> dict[str, Any] | None:
-        """``GET /health`` → ``{status, service, version, instance_id}``."""
-        return _as_dict(self._request("GET", "/health"))
+    def health(self, timeout: float | None = None) -> dict[str, Any] | None:
+        """``GET /health`` → ``{status, service, version, instance_id}``.
+
+        ``timeout`` overrides the read timeout; the auto-start readiness poll uses a
+        short one so a deadline is spent on attempts rather than one hung probe.
+        """
+        return _as_dict(self._request("GET", "/health", timeout=timeout))
 
     def current_project(self, cwd: str) -> dict[str, Any] | None:
         """``GET /project/current`` → the project Engram resolves for ``cwd``.
@@ -471,6 +504,13 @@ def _build_opener(base_url: str) -> urllib.request.OpenerDirector:
     if host in _LOOPBACK_HOSTS:
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener()
+
+
+def _is_connection_refused(reason: Any) -> bool:
+    """Whether a urllib failure reason is a TCP connection refusal."""
+    if isinstance(reason, ConnectionRefusedError):
+        return True
+    return isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED
 
 
 def _query_value(value: Any) -> str:

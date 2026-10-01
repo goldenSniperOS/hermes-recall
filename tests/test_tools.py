@@ -662,8 +662,10 @@ def test_state_write_failure_is_swallowed(
 ) -> None:
     wire(fake_engram)
     provider = make_provider(fake_engram.base_url)
-    # A regular file where the recall/ directory must go makes every write fail.
-    (tmp_path / "recall").write_text("not a directory", encoding="utf-8")
+    # A directory where state.json must go makes every state write fail. (The
+    # recall/ directory itself already exists: initialize records the server
+    # lifecycle outcome in recall/server.json.)
+    (tmp_path / "recall" / "state.json").mkdir(parents=True, exist_ok=True)
 
     result = call(provider, "mem_save", title="T", content="C")
 

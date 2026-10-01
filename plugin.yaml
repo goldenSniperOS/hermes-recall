@@ -1,5 +1,5 @@
 name: recall
-version: 0.1.1
+version: 0.2.0
 manifest_version: 1
 kind: exclusive
 description: >-
@@ -17,8 +17,8 @@ tags: [memory, engram, recall, gentle-ai-compatible]
 config_schema:
   url:
     type: str
-    default: http://127.0.0.1:7437
-    description: "Base URL of the local Engram HTTP server (engram serve). The ENGRAM_URL environment variable wins over this value."
+    default: ""
+    description: "Base URL of the local Engram HTTP server (engram serve). Empty means http://127.0.0.1:<ENGRAM_PORT, default 7437>. The ENGRAM_URL environment variable wins over this value."
   project:
     type: str
     default: ""
@@ -35,6 +35,10 @@ config_schema:
     type: bool
     default: true
     description: "Set false to disable recall and capture without uninstalling the plugin."
+  autostart:
+    type: bool
+    default: true
+    description: "Start a detached engram serve when no Engram server answers at the default local address. Never used when ENGRAM_URL is set; the server is never stopped."
 provides_tools:
   - mem_search
   - mem_save

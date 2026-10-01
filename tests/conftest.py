@@ -32,6 +32,25 @@ ensure_repo_on_path()
 from fake_engram import FakeEngram  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _never_reach_the_real_engram(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep the auto-start path away from the user's real Engram, in every test.
+
+    The provider only spawns or probes for auto-start when the configured URL is the
+    address a plain ``engram serve`` would bind, which follows ``ENGRAM_PORT``. Port 1
+    is never what a test config points at, so the default URL can never match; tests
+    that exercise auto-start set ``ENGRAM_PORT`` to their own free port. ``ENGRAM_BIN``
+    points at a path that does not exist, so the real binary is never run, and an
+    ambient ``ENGRAM_URL`` would turn every auto-start test into a no-op.
+    """
+    monkeypatch.setenv("ENGRAM_PORT", "1")
+    missing = tmp_path_factory.getbasetemp() / "no-such-engram-binary"
+    monkeypatch.setenv("ENGRAM_BIN", str(missing))
+    monkeypatch.delenv("ENGRAM_URL", raising=False)
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     """The repository root, for tests that read shipped files."""

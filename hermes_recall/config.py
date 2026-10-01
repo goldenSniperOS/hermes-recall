@@ -6,7 +6,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_URL = "http://127.0.0.1:7437"
+DEFAULT_PORT = 7437
+DEFAULT_URL = f"http://127.0.0.1:{DEFAULT_PORT}"
 DEFAULT_RECALL_LIMIT = 5
 DEFAULT_RECALL_MAX_CHARS = 2500
 
@@ -46,6 +47,14 @@ class RecallConfig:
     auth_token: str
     """Bearer token for the Engram server, or ``""`` when unset."""
 
+    autostart: bool = True
+    """``True`` lets the primary agent start ``engram serve`` when none answers.
+
+    Defaulted so a caller (or a test) that builds a ``RecallConfig`` by hand keeps
+    the documented default. See ``server.py`` for the rules that still apply when it
+    is on (no ``ENGRAM_URL``, default loopback address only, never kill).
+    """
+
 
 def _load_recall_settings() -> dict[str, Any]:
     """Return the ``memory.recall`` block from the Hermes config (``{}`` on any error).
@@ -74,10 +83,36 @@ def _config_str(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def engram_port(environ: Any = None) -> int:
+    """The Engram HTTP port: ``ENGRAM_PORT`` when it is a valid port, else 7437.
+
+    Mirrors gentle-engram (``index.ts``: ``ENGRAM_PORT ?? "7437"``) and the binary,
+    whose ``engram serve`` documents ``ENGRAM_PORT  Override HTTP server port``.
+    An unparseable or out-of-range value falls back to the default rather than
+    producing a URL nothing could listen on.
+    """
+    env = os.environ if environ is None else environ
+    raw = str(env.get("ENGRAM_PORT", "") or "").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return DEFAULT_PORT
+    return port if 0 < port < 65536 else DEFAULT_PORT
+
+
+def default_url(environ: Any = None) -> str:
+    """The URL used when neither ``ENGRAM_URL`` nor ``memory.recall.url`` is set.
+
+    ``http://127.0.0.1:<ENGRAM_PORT or 7437>``, exactly gentle-engram's
+    ``ENGRAM_URL = CONFIGURED_ENGRAM_URL || `http://127.0.0.1:${ENGRAM_PORT}```.
+    """
+    return f"http://127.0.0.1:{engram_port(environ)}"
+
+
 def _normalize_url(raw: str) -> str:
-    """Strip whitespace and trailing slashes; a blank result becomes the default."""
+    """Strip whitespace and trailing slashes; a blank result becomes :func:`default_url`."""
     cleaned = raw.strip().rstrip("/")
-    return cleaned or DEFAULT_URL
+    return cleaned or default_url()
 
 
 def _coerce_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -149,6 +184,7 @@ def load_config() -> RecallConfig:
             ),
             enabled=_coerce_bool(settings.get("enabled"), default=True),
             auth_token=os.environ.get("ENGRAM_HTTP_TOKEN", "").strip(),
+            autostart=_coerce_bool(settings.get("autostart"), default=True),
         )
     except Exception:
         return RecallConfig(
@@ -158,6 +194,7 @@ def load_config() -> RecallConfig:
             recall_max_chars=DEFAULT_RECALL_MAX_CHARS,
             enabled=True,
             auth_token="",
+            autostart=True,
         )
 
 
