@@ -1,3 +1,429 @@
-"""Stdlib HTTP client for the local Engram server: project detection, search, writes."""
+"""Stdlib HTTP client for the local Engram server: project detection, search, writes.
+
+Every public method is fail-soft: no exception escapes, failures return the
+documented empty value (``None``, ``[]`` or ``""``) and leave a human-readable
+reason in :meth:`EngramClient.last_error_text`. The provider sits on the critical
+path of every Hermes turn, so an unreachable or broken Engram must degrade to
+"no memory this turn", never to a traceback.
+
+Endpoint shapes are verified against a live Engram 2.0.0 server and the route
+table in ``engram/server.go``.
+"""
 
 from __future__ import annotations
+
+import json
+import logging
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from .config import RecallConfig, load_config
+
+logger = logging.getLogger(__name__)
+
+# Timeouts are deliberately far below the host's patience. Hermes joins an
+# external provider's prefetch for `_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0` seconds
+# (agent/memory_manager.py); on timeout `_prefetch_provider` leaves the thread
+# running and registers it, and every later turn that finds it still alive logs
+# "prefetch is still running; skipping this turn" and returns "" immediately.
+# One stuck HTTP call therefore disables recall for the rest of the session, not
+# just for the turn that blocked. So the client must give up long before 8s.
+READ_TIMEOUT_S = 2.0
+WRITE_TIMEOUT_S = 3.0
+
+# Keys `PATCH /observations/{id}` accepts, mapped to the client kwarg name.
+_UPDATABLE_FIELDS = ("type", "title", "content", "find", "replace", "project", "scope", "topic_key")
+
+# The only `match_mode` values the server accepts; anything else is a 400.
+_MATCH_MODES = frozenset({"all", "any"})
+
+
+class EngramClient:
+    """Thin, fail-soft HTTP client for one Engram server."""
+
+    def __init__(self, config: RecallConfig | None = None) -> None:
+        self._config = config if config is not None else load_config()
+        # `load_config` already normalises the URL, but a caller can hand in a
+        # RecallConfig it built itself. Re-stripping here makes "no trailing
+        # slash" an invariant of the client rather than a promise of its input:
+        # a trailing slash would otherwise produce `//health`, which Go's
+        # ServeMux answers with a redirect instead of the route.
+        self._base_url = self._config.url.strip().rstrip("/")
+        self._last_error: str = ""
+
+    # -- Introspection -------------------------------------------------------
+
+    @property
+    def base_url(self) -> str:
+        """The server's base URL, normalised with no trailing slash."""
+        return self._base_url
+
+    @property
+    def last_error(self) -> str:
+        """The most recent failure reason, or ``""`` when the last call succeeded."""
+        return self._last_error
+
+    def last_error_text(self) -> str:
+        """Return the last failure reason, or ``""`` when healthy."""
+        return self._last_error
+
+    # -- Transport -----------------------------------------------------------
+
+    def _record_error(self, message: str) -> None:
+        """Store a failure reason and log it at debug level only.
+
+        Never above debug: the provider is fail-soft, and an Engram server that
+        is simply not running would otherwise print a warning on every turn.
+        """
+        self._last_error = message
+        logger.debug("engram client: %s", message)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Perform one HTTP request and return the decoded JSON, or ``None`` on failure.
+
+        Query params whose value is ``None`` or ``""`` are dropped — the server
+        rejects a blank ``project`` outright, and an omitted param is how its
+        defaults are selected. ``0`` and ``False`` are real values and survive as
+        ``"0"`` / ``"false"``.
+        """
+        url = f"{self._base_url}{path}"
+        if params:
+            filtered = {
+                key: _query_value(value)
+                for key, value in params.items()
+                if value is not None and value != ""
+            }
+            if filtered:
+                url = f"{url}?{urllib.parse.urlencode(filtered)}"
+
+        headers = {"Accept": "application/json"}
+        data: bytes | None = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if self._config.auth_token:
+            headers["Authorization"] = f"Bearer {self._config.auth_token}"
+
+        if timeout is None:
+            # Read through the module namespace rather than binding the constants
+            # as default argument values: defaults are evaluated once at function
+            # definition, so a test that monkeypatches READ_TIMEOUT_S/
+            # WRITE_TIMEOUT_S would otherwise have no effect.
+            timeout = READ_TIMEOUT_S if method == "GET" else WRITE_TIMEOUT_S
+
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+                raw = response.read()
+            self._last_error = ""
+            if not raw:
+                return None
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # A 2xx that is not JSON is not an exception to propagate; the
+                # caller's documented empty value is the right answer.
+                self._record_error(f"{method} {path}: response body was not valid JSON")
+                return None
+        except urllib.error.HTTPError as exc:
+            # Never include the request body in the recorded reason: it carries
+            # user content (observation text, prompts, search queries).
+            detail = _http_error_detail(exc)
+            self._record_error(f"{method} {path}: HTTP {exc.code}{detail}")
+            return None
+        except urllib.error.URLError as exc:
+            self._record_error(f"{method} {path}: unreachable ({exc.reason})")
+            return None
+        except TimeoutError:
+            self._record_error(f"{method} {path}: timed out after {timeout:g}s")
+            return None
+        except OSError as exc:
+            self._record_error(f"{method} {path}: OS error ({exc})")
+            return None
+        except json.JSONDecodeError as exc:
+            self._record_error(f"{method} {path}: malformed JSON ({exc.msg})")
+            return None
+        except Exception as exc:  # noqa: BLE001 - fail-soft backstop
+            self._record_error(f"{method} {path}: unexpected {type(exc).__name__}")
+            return None
+
+    # -- Health and project --------------------------------------------------
+
+    def health(self) -> dict[str, Any] | None:
+        """``GET /health`` → ``{status, service, version, instance_id}``."""
+        return _as_dict(self._request("GET", "/health"))
+
+    def current_project(self, cwd: str) -> dict[str, Any] | None:
+        """``GET /project/current`` → the project Engram resolves for ``cwd``.
+
+        Returns ``{project, project_source, project_path, cwd, available_projects}``.
+        A 200 whose ``project`` is ``""`` and which carries an ``error_hint`` is
+        Engram's *ambiguous project* answer, not a failure — it is returned
+        unchanged so the caller can ask the user to choose.
+        """
+        return _as_dict(self._request("GET", "/project/current", params={"cwd": cwd}))
+
+    # -- Sessions ------------------------------------------------------------
+
+    def create_session(
+        self, session_id: str, project: str, directory: str = ""
+    ) -> dict[str, Any] | None:
+        """``POST /sessions`` → ``{"id", "status"}`` (HTTP 201)."""
+        body: dict[str, Any] = {
+            "id": session_id,
+            "project": project,
+            "ownership_mode": "project_owned",
+        }
+        if directory.strip():
+            body["directory"] = directory
+        return _as_dict(self._request("POST", "/sessions", body=body))
+
+    def end_session(self, session_id: str, summary: str = "") -> dict[str, Any] | None:
+        """``POST /sessions/{id}/end`` → ``{"id", "status"}``."""
+        quoted = urllib.parse.quote(session_id, safe="")
+        return _as_dict(self._request("POST", f"/sessions/{quoted}/end", body={"summary": summary}))
+
+    # -- Observations --------------------------------------------------------
+
+    def add_observation(
+        self,
+        session_id: str,
+        title: str,
+        content: str,
+        *,
+        type_: str = "manual",
+        project: str = "",
+        scope: str = "project",
+        topic_key: str = "",
+        tool_name: str = "",
+    ) -> dict[str, Any] | None:
+        """``POST /observations`` → ``{"id": <int>, "status": "saved"}`` (HTTP 201)."""
+        # The server requires session_id, title and content, and validates the
+        # title first (a whitespace-only title is rejected). Checking here turns
+        # a guaranteed 400 into a free local answer.
+        missing = [
+            name
+            for name, value in (
+                ("session_id", session_id),
+                ("title", title),
+                ("content", content),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            self._record_error(
+                "POST /observations: refused locally, blank required field(s): "
+                + ", ".join(missing)
+            )
+            return None
+
+        body: dict[str, Any] = {
+            "session_id": session_id,
+            "type": type_,
+            "title": title,
+            "content": content,
+        }
+        for key, value in (
+            ("project", project),
+            ("scope", scope),
+            ("topic_key", topic_key),
+            ("tool_name", tool_name),
+        ):
+            if value.strip():
+                body[key] = value
+        return _as_dict(self._request("POST", "/observations", body=body))
+
+    def update_observation(self, observation_id: int, **fields: Any) -> dict[str, Any] | None:
+        """``PATCH /observations/{id}`` → the full updated observation.
+
+        Only the keys explicitly passed are sent. The server's patch params are
+        **pointers** (``store.UpdateObservationParams``), so an absent key and an
+        empty-string key are different instructions: absent means "leave it
+        alone", empty means "set it to empty". Dropping ``None`` preserves that
+        distinction while giving callers a way to say "not this one"; unknown
+        keys are ignored rather than forwarded.
+        """
+        body = {
+            key: value
+            for key, value in fields.items()
+            if key in _UPDATABLE_FIELDS and value is not None
+        }
+        if not body:
+            # The server 400s on an empty patch ("at least one field is required").
+            self._record_error(
+                f"PATCH /observations/{observation_id}: refused locally, no updatable fields given"
+            )
+            return None
+        return _as_dict(self._request("PATCH", f"/observations/{observation_id}", body=body))
+
+    def get_observation(self, observation_id: int) -> dict[str, Any] | None:
+        """``GET /observations/{id}`` → the observation, or ``None`` when missing."""
+        return _as_dict(self._request("GET", f"/observations/{observation_id}"))
+
+    def recent_observations(
+        self, project: str = "", limit: int = 20, scope: str = ""
+    ) -> list[dict[str, Any]]:
+        """``GET /observations/recent`` → newest observations first; ``[]`` on failure."""
+        return _as_list(
+            self._request(
+                "GET",
+                "/observations/recent",
+                params={"project": project, "limit": limit, "scope": scope},
+            )
+        )
+
+    def passive_capture(
+        self, session_id: str, content: str, project: str = "", source: str = ""
+    ) -> dict[str, Any] | None:
+        """``POST /observations/passive`` → ``{extracted, saved, duplicates}`` (HTTP 200)."""
+        body: dict[str, Any] = {"session_id": session_id, "content": content}
+        for key, value in (("project", project), ("source", source)):
+            if value.strip():
+                body[key] = value
+        return _as_dict(self._request("POST", "/observations/passive", body=body))
+
+    # -- Search and context --------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        project: str = "",
+        limit: int = 10,
+        match_mode: str = "any",
+        type_: str = "",
+        scope: str = "",
+        all_projects: bool = False,
+    ) -> list[dict[str, Any]]:
+        """``GET /search`` → ranked hits; always a list, ``[]`` on failure."""
+        if not query.strip():
+            # The server 400s on a blank `q`, so there is nothing to ask it.
+            self._record_error("GET /search: refused locally, blank query")
+            return []
+
+        params: dict[str, Any] = {"q": query, "limit": limit, "type": type_, "scope": scope}
+
+        # `project` and `all_projects` together is a 400, so they are mutually
+        # exclusive here, with all_projects winning because it is the explicit ask.
+        if all_projects:
+            params["all_projects"] = True
+        elif project.strip():
+            params["project"] = project
+
+        # An unrecognised match_mode is a 400 rather than a fallback, so drop it
+        # and let the server apply its own default.
+        normalized_mode = match_mode.strip().lower() if isinstance(match_mode, str) else ""
+        if normalized_mode in _MATCH_MODES:
+            params["match_mode"] = normalized_mode
+
+        return _as_list(self._request("GET", "/search", params=params))
+
+    def context(self, project: str = "", scope: str = "") -> str:
+        """``GET /context`` → the formatted context block; ``""`` on failure."""
+        return _as_context(
+            self._request("GET", "/context", params={"project": project, "scope": scope})
+        )
+
+    def compaction_context(self, session_id: str) -> str:
+        """``GET /context/compaction`` → the session's compaction block; ``""`` on failure."""
+        if not session_id.strip():
+            # The server requires session_id.
+            self._record_error("GET /context/compaction: refused locally, blank session_id")
+            return ""
+        return _as_context(
+            self._request("GET", "/context/compaction", params={"session_id": session_id})
+        )
+
+    # -- Prompts, timeline, stats -------------------------------------------
+
+    def add_prompt(self, session_id: str, content: str, project: str = "") -> dict[str, Any] | None:
+        """``POST /prompts`` → ``{"id", "status"}``."""
+        missing = [
+            name
+            for name, value in (("session_id", session_id), ("content", content))
+            if not value.strip()
+        ]
+        if missing:
+            # The server requires both.
+            self._record_error(
+                f"POST /prompts: refused locally, blank required field(s): {', '.join(missing)}"
+            )
+            return None
+        body: dict[str, Any] = {"session_id": session_id, "content": content}
+        if project.strip():
+            body["project"] = project
+        return _as_dict(self._request("POST", "/prompts", body=body))
+
+    def timeline(
+        self, observation_id: int, before: int = 5, after: int = 5, project: str = ""
+    ) -> dict[str, Any] | None:
+        """``GET /timeline`` → the focus observation with its neighbours."""
+        return _as_dict(
+            self._request(
+                "GET",
+                "/timeline",
+                params={
+                    "observation_id": observation_id,
+                    "before": before,
+                    "after": after,
+                    "project": project,
+                },
+            )
+        )
+
+    def stats(self, project: str = "", all_projects: bool = False) -> dict[str, Any] | None:
+        """``GET /stats`` → store counters for one project or the whole server."""
+        params: dict[str, Any] = {}
+        if all_projects:
+            params["all_projects"] = True
+        elif project.strip():
+            params["project"] = project
+        return _as_dict(self._request("GET", "/stats", params=params))
+
+
+def _query_value(value: Any) -> str:
+    """Render a query param value, keeping ``0`` and ``False`` as real values."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Extract the server's ``error`` field from an HTTPError body, if present."""
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        return f" {exc.reason}" if exc.reason else ""
+    if isinstance(payload, dict):
+        message = payload.get("error")
+        if isinstance(message, str) and message:
+            return f" {message}"
+    return f" {exc.reason}" if exc.reason else ""
+
+
+def _as_dict(payload: Any) -> dict[str, Any] | None:
+    """Return ``payload`` when it is a dict, else ``None``."""
+    return payload if isinstance(payload, dict) else None
+
+
+def _as_list(payload: Any) -> list[dict[str, Any]]:
+    """Return ``payload`` when it is a list, else ``[]`` — these methods always list."""
+    return payload if isinstance(payload, list) else []
+
+
+def _as_context(payload: Any) -> str:
+    """Return the ``"context"`` string from a context response, else ``""``."""
+    if isinstance(payload, dict):
+        context = payload.get("context")
+        if isinstance(context, str):
+            return context
+    return ""

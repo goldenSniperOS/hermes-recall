@@ -9,6 +9,7 @@ the repository root on ``sys.path``, then ``import hermes_recall``.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -25,8 +26,27 @@ def ensure_repo_on_path() -> None:
 
 ensure_repo_on_path()
 
+# Imported after the path fix-up and so below the other imports: ``fake_engram``
+# lives beside this file, which is on ``sys.path`` because pytest puts a
+# conftest's own directory there when it imports it.
+from fake_engram import FakeEngram  # noqa: E402
+
 
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     """The repository root, for tests that read shipped files."""
     return REPO_ROOT
+
+
+@pytest.fixture
+def fake_engram() -> Iterator[FakeEngram]:
+    """A started in-process Engram stand-in, stopped on teardown.
+
+    Function-scoped on purpose: tests assert on the recorded request log, so each
+    one needs a server that has seen nothing yet.
+    """
+    server = FakeEngram()
+    try:
+        yield server
+    finally:
+        server.stop()
