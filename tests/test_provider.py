@@ -975,9 +975,6 @@ def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
 @pytest.mark.parametrize(
     "hook",
     [
-        "on_turn_start",
-        "sync_turn",
-        "on_delegation",
         "on_session_switch",
         "on_session_end",
         "on_pre_compress",
@@ -985,8 +982,18 @@ def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
     ],
 )
 def test_lifecycle_hooks_are_still_inherited(hook: str) -> None:
-    """T4/T5/T6 own these; T3 must not stub them with wrong behaviour."""
+    """T5/T6 own these; they must not be stubbed early with wrong behaviour.
+
+    ``on_turn_start``, ``sync_turn`` and ``on_delegation`` left this list in T4,
+    which implemented them — see tests/test_capture.py.
+    """
     assert hook not in vars(RecallProvider), f"{hook} was implemented early"
+
+
+@pytest.mark.parametrize("hook", ["on_turn_start", "sync_turn", "on_delegation"])
+def test_capture_hooks_are_implemented(hook: str) -> None:
+    """The other half of the above: T4's hooks must be real overrides, not inherited."""
+    assert hook in vars(RecallProvider), f"{hook} is still the inherited no-op"
 
 
 def test_pre_compress_checkpoint_api_version_is_one() -> None:

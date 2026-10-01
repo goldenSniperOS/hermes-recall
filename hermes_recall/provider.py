@@ -16,6 +16,7 @@ from ._hermes import MemoryProvider, RecallStatus, is_trivial_prompt
 from .client import EngramClient
 from .config import RecallConfig, load_config
 from .format import render_recall_block
+from .redact import strip_private, truncate
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,52 @@ QUERY_MAX_CHARS = 200
 # this must stay >= 2 * READ_TIMEOUT_S (or the budget would cut off recall) and
 # comfortably below the host's 8s join.
 PREFETCH_BUDGET_S = 4.0
+
+# Prompt capture. Upstream gentle-engram posts ``/prompts`` only when the trimmed
+# prompt is longer than 10 characters (``finalContent.length > 10``, index.ts) and
+# caps it at 2000 (``truncate(finalContent, 2000)``). Both adopted for parity: the
+# floor keeps "ok then" out of the prompt log, the cap keeps a pasted stack trace
+# from becoming the user's remembered words.
+PROMPT_MAX_CHARS = 2000
+PROMPT_MIN_CHARS = 10
+
+# Passive capture. Upstream skips a tool result of 50 characters or fewer
+# (``content.length <= 50``, index.ts ``tool_execution_end``) and imposes no upper
+# bound on passive content — both adopted.
+PASSIVE_MIN_CHARS = 50
+
+# ...but upstream captures one tool result per event, whereas we are handed the whole
+# turn at once. A 200-tool-call turn would otherwise become 200 serialized HTTP
+# writes on a single worker, which is how a background queue turns into a backlog
+# that outlives the turn it belongs to. Cap the posts per turn instead.
+PASSIVE_MAX_CAPTURES_PER_TURN = 12
+
+# Delegation capture. A subagent transcript is unbounded — it is a whole agent run —
+# so both halves are capped before they are composed. The result gets the larger
+# share because it is the part that carries findings; the task is a prompt, and a
+# prompt that needs more than 1000 characters to identify is already summarised by
+# its first 1000.
+DELEGATION_TASK_MAX_CHARS = 1000
+DELEGATION_RESULT_MAX_CHARS = 4000
+
+# This provider's own tool names, whose results must never be passively captured.
+# Upstream guards the same way (``if (ENGRAM_TOOL_NAMES.has(toolName.toLowerCase()))
+# return;``, index.ts ``tool_execution_end``) and for a sharp reason: capturing the
+# result of a `mem_search` would write recalled memories back in as new observations,
+# a feedback loop that inflates the store every time the model looks something up.
+# T6 owns the authoritative schema list in ``tools.py`` and must derive this set from
+# it rather than keep a second copy.
+_MEMORY_TOOL_NAMES = frozenset(
+    {
+        "mem_search",
+        "mem_save",
+        "mem_update",
+        "mem_get_observation",
+        "mem_context",
+        "mem_session_summary",
+        "mem_timeline",
+    }
+)
 
 # Hermes core already gave its own background executor a 5s FIFO drain before it
 # calls provider ``shutdown()``, and the user is waiting on process exit by then.
@@ -146,6 +193,14 @@ class RecallProvider(MemoryProvider):
         self._last_recall_injected: bool = False
         self._prefetch_cache: _Recall | None = None
         self._context_fetched: bool = False
+
+        # Capture state, per session.
+        self._turn_number: int = 0
+        # High-water mark into the host's message list: how many messages have
+        # already been considered for passive capture. The host hands us the WHOLE
+        # conversation every turn, so without this every turn would re-capture every
+        # earlier turn's tool results.
+        self._synced_message_count: int = 0
 
         # Background worker, started lazily on first use.
         self._queue: queue.Queue[tuple[str, Callable[[], None] | None]] = queue.Queue(
@@ -373,14 +428,27 @@ class RecallProvider(MemoryProvider):
     def _reset_project_cache(self) -> None:
         """Forget the detected project and any cached recall.
 
-        T5 calls this from ``on_session_switch``: a switch can follow a directory
-        change, so the project has to be re-detected and a recall computed for the
-        old project must not be served for the new one.
+        The narrow reset: everything derived from *which project we are in*. Use
+        :meth:`_reset_session_state` for a session switch, which also clears the
+        per-session capture bookkeeping.
         """
         self._project = ""
         self._project_detected = False
         self._invalidate_prefetch_cache()
         self._context_fetched = False
+
+    def _reset_session_state(self) -> None:
+        """Forget everything scoped to one session. **This is T5's entry point.**
+
+        ``on_session_switch`` must call this, not :meth:`_reset_project_cache` alone:
+        a switch can follow a directory change (re-detect the project) *and* starts a
+        fresh transcript, so the passive-capture high-water mark has to go back to
+        zero or the new session's early tool results would be skipped as "already
+        seen". The turn counter is per session for the same reason.
+        """
+        self._reset_project_cache()
+        self._turn_number = 0
+        self._synced_message_count = 0
 
     def _invalidate_prefetch_cache(self) -> None:
         """Drop the queued-prefetch cache. Exposed for T5's session-switch hook."""
@@ -582,6 +650,219 @@ class RecallProvider(MemoryProvider):
         except Exception:
             return None
 
+    # -- Capture -------------------------------------------------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
+        """Log the user's prompt to Engram. Runs on the turn thread; never blocks it.
+
+        Trivial prompts are **not** skipped here, and that asymmetry with
+        :meth:`prefetch` is deliberate: a prompt is the user's own words and the
+        prompt log is a different artifact from recall. "go ahead please" is worth
+        nothing as a search query and still worth having in the record of what was
+        asked. The only floor is :data:`PROMPT_MIN_CHARS`, which is upstream's.
+        """
+        try:
+            self._turn_number = turn_number if isinstance(turn_number, int) else 0
+
+            if not self._write_gate_open():
+                return
+
+            content = self._prompt_content(message)
+            if not content or len(content) <= PROMPT_MIN_CHARS:
+                return
+
+            session_id = self._session_id
+
+            def job() -> None:
+                project = self._ensure_project()
+                if not project:
+                    logger.debug("recall: no project; dropping prompt capture")
+                    return
+                self._client.add_prompt(session_id, content, project=project)
+
+            self._submit("prompt-capture", job)
+        except Exception:
+            logger.debug("recall on_turn_start failed (non-fatal)", exc_info=True)
+
+    def _prompt_content(self, message: str) -> str:
+        """Prepare a user message for the prompt log: recover, redact, then cap.
+
+        **Order note.** Upstream does ``stripPrivateTags(truncate(content, 2000))`` —
+        truncate first. We redact first, on purpose. With upstream's order a
+        ``<private>`` block that *straddles* the 2000-character boundary loses its
+        closing tag to the cut, the non-greedy pattern then finds no match, and the
+        opening fragment of the secret is stored. Redacting first removes complete
+        blocks wherever they sit and only then caps the remainder, so the boundary
+        can never turn a redaction into a leak. Nothing downstream can tell the
+        difference except that the secret is gone, which is the point.
+        """
+        recovered = _user_instruction(message)
+        if recovered is None:
+            # A bare skill invocation carries no user instruction; there is nothing
+            # the user actually said to log.
+            logger.debug("recall: prompt is bare skill scaffolding; nothing to log")
+            return ""
+        return truncate(strip_private(recovered), PROMPT_MAX_CHARS)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Passively capture what the completed turn produced. Never raises.
+
+        Mirrors gentle-engram's ``tool_execution_end``: the turn's new tool results
+        and the assistant's reply are handed to Engram's extractor, which decides
+        what is worth keeping.
+
+        The host calls this on its own background worker, but the message list it
+        passes is the agent's **live** list. The slice to capture is therefore
+        snapshotted here, synchronously, before anything is queued — reading it later
+        from our worker would race the next turn appending to it, or a compaction
+        truncating it.
+
+        ``messages`` is declared explicitly because the host probes the signature and
+        only passes it when the parameter exists (``_provider_sync_accepts_messages``).
+        """
+        try:
+            if not self._write_gate_open():
+                return
+
+            captures = self._collect_captures(assistant_content, messages)
+            if not captures:
+                return
+
+            session_id_for_turn = self._resolve_session_id(session_id)
+            if not session_id_for_turn:
+                return
+
+            def job() -> None:
+                project = self._ensure_project()
+                if not project:
+                    logger.debug("recall: no project; dropping %d captures", len(captures))
+                    return
+                for source, content in captures:
+                    # Guarded individually: one rejected capture must not abandon the
+                    # rest of the turn's.
+                    try:
+                        self._client.passive_capture(
+                            session_id_for_turn, content, project=project, source=source
+                        )
+                    except Exception:
+                        logger.debug("recall: capture from %s failed", source, exc_info=True)
+
+            self._submit("passive-capture", job)
+        except Exception:
+            logger.debug("recall sync_turn failed (non-fatal)", exc_info=True)
+
+    def _collect_captures(
+        self, assistant_content: str, messages: list[dict[str, Any]] | None
+    ) -> list[tuple[str, str]]:
+        """Build this turn's ``(source, content)`` captures and advance the high-water mark.
+
+        The assistant's reply comes **first** so it survives
+        :data:`PASSIVE_MAX_CAPTURES_PER_TURN`: it is the turn's own summary of what
+        happened, and a turn with a dozen large tool results is exactly the turn
+        whose summary is most worth keeping.
+        """
+        candidates: list[tuple[str, str]] = []
+
+        if isinstance(assistant_content, str) and assistant_content:
+            candidates.append(("assistant", assistant_content))
+
+        if isinstance(messages, list):
+            snapshot = list(messages)
+            start = self._synced_message_count
+            if start > len(snapshot):
+                # The transcript shrank, so it was compacted or rewound under us.
+                # Treat everything currently present as seen: re-posting a whole
+                # history would be worse than missing one turn, and T5 owns the
+                # explicit compaction/rewind hooks.
+                logger.debug(
+                    "recall: transcript shrank (%d -> %d); resetting capture mark",
+                    start,
+                    len(snapshot),
+                )
+                start = len(snapshot)
+            candidates.extend(_extract_tool_captures(snapshot, start))
+            self._synced_message_count = len(snapshot)
+
+        captures: list[tuple[str, str]] = []
+        for source, raw in candidates:
+            # Upstream measures the floor on the RAW content, before redaction, so a
+            # long block that redacts down to almost nothing is still offered up.
+            if len(raw) <= PASSIVE_MIN_CHARS:
+                continue
+            content = strip_private(raw)
+            if not content:
+                continue
+            if len(captures) >= PASSIVE_MAX_CAPTURES_PER_TURN:
+                logger.debug(
+                    "recall: hit the per-turn capture cap (%d); dropping the rest",
+                    PASSIVE_MAX_CAPTURES_PER_TURN,
+                )
+                break
+            captures.append((source, content))
+        return captures
+
+    def on_delegation(
+        self, task: str, result: str, *, child_session_id: str = "", **kwargs: Any
+    ) -> None:
+        """Capture a completed subagent delegation as one observation. Never raises.
+
+        ``child_session_id`` is logged but kept **out** of the captured content: the
+        subagent runs with no provider session of its own (the ABC notes subagents are
+        created with ``skip_memory=True``), so the id refers to nothing retrievable
+        from Engram and would be an unresolvable reference inside the observation.
+        """
+        try:
+            if not self._write_gate_open():
+                return
+
+            composed = _compose_delegation(task, result)
+            if len(composed) <= PASSIVE_MIN_CHARS:
+                return
+            content = strip_private(composed)
+            if not content:
+                return
+
+            session_id = self._session_id
+            logger.debug("recall: capturing delegation from child session %r", child_session_id)
+
+            def job() -> None:
+                project = self._ensure_project()
+                if not project:
+                    logger.debug("recall: no project; dropping delegation capture")
+                    return
+                self._client.passive_capture(
+                    session_id, content, project=project, source="subagent"
+                )
+
+            self._submit("delegation-capture", job)
+        except Exception:
+            logger.debug("recall on_delegation failed (non-fatal)", exc_info=True)
+
+    def _write_gate_open(self) -> bool:
+        """Whether this provider may write to Engram at all right now.
+
+        One gate for every capture path, so "disabled", "not the primary agent" and
+        "no registered session" can never be enforced in three slightly different
+        ways. The project check is deliberately *not* here: it can cost a request, so
+        it belongs on the worker.
+        """
+        if not self._config.enabled:
+            return False
+        if not self._writes_enabled:
+            # Non-primary agent_context (subagent, cron, flush). A cron system prompt
+            # or a subagent transcript would land in the user's project memory as if
+            # the user had said it.
+            logger.debug("recall: writes disabled for agent_context=%s", self._agent_context)
+            return False
+        return bool(self._session_id)
+
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -646,3 +927,130 @@ def _working_directory() -> str:
         return os.getcwd()
     except OSError:
         return ""
+
+
+def _extract_tool_captures(messages: list[Any], start: int) -> list[tuple[str, str]]:
+    """Return ``(source, content)`` for every tool result at or after index ``start``.
+
+    A tool result is a message with ``role == "tool"`` and non-empty string content.
+    The source is the message's own ``name``, else the function name of the matching
+    ``tool_call_id`` on an earlier assistant message, else the literal ``"tool"``.
+
+    Anything whose shape is not recognised is **skipped, not guessed**: this parses a
+    transcript produced by someone else, and inventing a capture out of a shape we do
+    not understand is how a memory store fills with nonsense. Results from this
+    provider's own tools are skipped too — see :data:`_MEMORY_TOOL_NAMES`.
+    """
+    tool_call_names = _tool_call_names(messages)
+    captures: list[tuple[str, str]] = []
+    for message in messages[max(0, start) :]:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        source = _tool_source(message, tool_call_names)
+        if source.lower() in _MEMORY_TOOL_NAMES:
+            continue
+        captures.append((source, content))
+    return captures
+
+
+def _tool_call_names(messages: list[Any]) -> dict[str, str]:
+    """Map ``tool_call_id`` to function name, from every assistant message present.
+
+    Built over the whole snapshot rather than the new slice: the assistant message
+    that issued a call is normally in the same turn, but nothing guarantees it, and a
+    missing entry only costs the generic ``"tool"`` source.
+    """
+    names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id")
+            function = call.get("function")
+            if not isinstance(call_id, str) or not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if isinstance(name, str) and name.strip():
+                names[call_id] = name.strip()
+    return names
+
+
+def _tool_source(message: dict[str, Any], tool_call_names: dict[str, str]) -> str:
+    """Best available name for the tool that produced this result."""
+    name = message.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    call_id = message.get("tool_call_id")
+    if isinstance(call_id, str):
+        resolved = tool_call_names.get(call_id)
+        if resolved:
+            return resolved
+    return "tool"
+
+
+def _compose_delegation(task: str, result: str) -> str:
+    """Render a delegation as one observation body, each half capped independently."""
+    task_text = truncate(task if isinstance(task, str) else "", DELEGATION_TASK_MAX_CHARS)
+    result_text = truncate(result if isinstance(result, str) else "", DELEGATION_RESULT_MAX_CHARS)
+    return f"**Delegated task**: {task_text}\n\n**Subagent result**: {result_text}"
+
+
+def _user_instruction(message: Any) -> str | None:
+    """Recover the user's own words from a possibly skill-expanded turn message.
+
+    ``None`` means "this turn carried no user instruction" (a bare ``/skill``
+    invocation), which the caller treats as nothing to log.
+
+    Why this exists: when the user invokes a ``/skill`` or ``/bundle``, Hermes expands
+    the turn into a model-facing message embedding the entire skill body.
+    ``MemoryManager`` strips that for ``prefetch_all`` and ``sync_all`` — its own
+    docstring says feeding it verbatim to providers "pollutes their stores/embeddings
+    with prompt scaffolding instead of what the user actually asked" — but the
+    ``on_turn_start`` fan-out does **not** strip it, so the raw expansion reaches us.
+    Rather than guess the scaffolding format, borrow the host's own extractor when it
+    is importable and otherwise pass the message through unchanged.
+    """
+    if not isinstance(message, str):
+        return ""
+    extractor = _skill_instruction_extractor()
+    if extractor is None:
+        return message
+    try:
+        recovered = extractor(message)
+    except Exception:
+        return message
+    if recovered is None:
+        return None
+    return recovered if isinstance(recovered, str) else message
+
+
+_EXTRACTOR_UNRESOLVED = object()
+_skill_extractor: Any = _EXTRACTOR_UNRESOLVED
+
+
+def _skill_instruction_extractor() -> Any:
+    """Resolve Hermes' skill-message extractor once, caching the miss as well as the hit.
+
+    Caching the *failure* matters: Python does not cache a failed import, so retrying
+    would re-scan ``sys.path`` on every single turn — on the prompt path, which runs
+    before prefetch. Outside Hermes (every test run) the answer is ``None``.
+    """
+    global _skill_extractor
+    if _skill_extractor is _EXTRACTOR_UNRESOLVED:
+        try:
+            from agent.skill_commands import (  # type: ignore[import-not-found]
+                extract_user_instruction_from_skill_message,
+            )
+
+            _skill_extractor = extract_user_instruction_from_skill_message
+        except Exception:
+            _skill_extractor = None
+    return _skill_extractor
