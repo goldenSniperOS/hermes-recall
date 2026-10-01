@@ -6,6 +6,16 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-01
+
+### Fixed
+
+- `hermes plugins install goldenSniperOS/hermes-recall` was blocked by the Hermes
+  install scanner (community source, caution verdict): the agent install prompt
+  mentioned a privilege-escalation command, which the scanner rates high. The
+  prompt now says "administrator rights", and a test runs the real Hermes scanner over the tracked tree and requires a
+  `safe` verdict.
+
 ## [0.1.0] - 2026-10-01
 
 First release: an exclusive Hermes Agent memory provider, activated with

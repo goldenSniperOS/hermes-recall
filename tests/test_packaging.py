@@ -31,7 +31,8 @@ def test_all_version_surfaces_match() -> None:
         "plugin.yaml": manifest_field("version"),
         "hermes_recall.__version__": hermes_recall.__version__,
     }
-    assert set(versions.values()) == {"0.1.0"}, versions
+    assert len(set(versions.values())) == 1, versions
+    assert set(versions.values()) == {_latest_changelog_release()}, versions
 
 
 def test_version_is_semver() -> None:
@@ -69,6 +70,13 @@ def test_pyproject_name_dependencies_and_entry_point() -> None:
     assert project["dependencies"] == []
     entry_points = project["entry-points"]["hermes_agent.memory_providers"]
     assert entry_points == {"recall": "hermes_recall:register"}
+
+
+def _latest_changelog_release() -> str:
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    match = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, flags=re.M)
+    assert match, "CHANGELOG.md has no released version section"
+    return match.group(1)
 
 
 def test_changelog_has_unreleased_and_first_release() -> None:

@@ -110,6 +110,12 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   `memory status` shows `Provider: recall ... available`, a real `hermes chat -q`
   turn showed `🧠 Recall · hermes-recall — recalled 3 memories`, prompt captured,
   session registered and ended, `state.json` written.
+- Fix pass commit: `96ffb77`, approved by native review (lineage
+  review-625857e7947d058e, 4 lenses, 8 non-blocking advisories).
+- v0.1.0 tagged at `96ffb77`, public repo goldenSniperOS/hermes-recall, CI and
+  release green (4 assets). GitHub install was then blocked by the Hermes install
+  scanner (`sudo_usage` in the install prompt); fixed in v0.1.1 with a scanner
+  regression test.
 - Independent verification (gentle-ai-verify): no blockers; 2 majors (private-tag
   redaction after truncation in compaction/delegation, no session registration
   retry) and minors. Fix pass (Pi gentle-ai-worker, test-first): redaction before
@@ -120,5 +126,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 
 ## Next step
 
-Fix the verifier findings, then public repo, tag v0.1.0, GitHub install check,
-and T8 in hermes-odd (other session).
+Release v0.1.1, re-check the GitHub install in a throwaway home, then the live
+profile install (owner approval for memory.provider). Follow-ups for v0.2:
+review advisories (pre-registration doubling outage cost, delegation non-str
+guard, pip-install CLI gap). T8 is owned by the hermes-odd session.

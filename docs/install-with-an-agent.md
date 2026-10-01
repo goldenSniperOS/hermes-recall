@@ -36,7 +36,8 @@ HARD RULES
   ~/.engram/). hermes-recall uses the existing Engram database as it is.
 - Ask me before switching memory.provider if another provider is active,
   and before removing the Engram MCP server.
-- If a command needs a password, sudo, or a credential, stop and ask me.
+- If a command needs a password, administrator rights, or a credential,
+  stop and ask me.
 
 STEP 0 - Detect the starting point and tell me which one applies:
   - `engram --version` (missing = not installed)
