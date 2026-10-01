@@ -66,12 +66,12 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
       state file. Route: delegated.
 - [x] T7 Docs + credits + install prompt; real install in throwaway HERMES_HOME; v0.1.0
       release; public repo. Route: inline.
-- [ ] T9 v0.2.0 Engram server auto-start, parity with gentle-engram: adopt a healthy
+- [x] T9 v0.2.0 Engram server auto-start, parity with gentle-engram: adopt a healthy
       server with matching instance id, spawn a detached `engram serve` when none
       answers (default loopback URL, ENGRAM_URL unset, primary context only), one
       bounded restart, cross-process lock, `memory.recall.autostart`, never kill.
       Route: delegated (Pi gentle-ai-worker), then verify + native review.
-- [ ] T10 Live install on the owner's Hermes (authorized): hermes-recall v0.2.0,
+- [x] T10 Live install on the owner's Hermes (authorized): hermes-recall v0.2.0,
       `memory.provider recall`, keep the Engram MCP for now, hermes-odd v0.7.0;
       owner sends /restart. Route: inline.
 - [x] T8 (owned by the hermes-odd session) hermes-odd v0.7.0: doctor detects provider, status shows last memory id,
@@ -133,7 +133,21 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   context, loopback without proxies, MCP Engram results not captured, real
   Hermes loader test. 593 tests passed, ruff clean.
 
+- T9 auto-start: `40e92ae` (Pi gentle-ai-worker, test-first; independent verify
+  found 2 majors, fixed: foreign-instance gating and ENGRAM_PORT default URL).
+  Real-binary smoke on an isolated port and data dir: `started` in 0.52 s, then
+  `adopted`; the live server on 7437 classifies as `adopted`. Native review
+  approved (review-e677f03752b50710, 7 non-blocking advisories). v0.2.0 tagged,
+  CI and release green, GitHub install in a throwaway home passes the scanner.
+  676 tests.
+- T10 live install: the default profile already had recall 0.1.1 +
+  `memory.provider recall` + hermes-odd 0.7.0 (installed 10:38, not by this
+  session); updated recall to 0.2.0 (`40e92ae`). Engram MCP kept. Profile
+  `buscador-casa` untouched. Waiting for the owner's /restart.
+
 ## Next step
 
-T9 auto-start (v0.2.0), then T10 live install. Remaining v0.2 follow-ups:
-pre-registration doubling outage cost, delegation non-str guard, pip-install CLI gap.
+Owner sends /restart and checks the 🧠 line and /odd_status. v0.2.x follow-ups:
+review advisories (server.py docstrings, "unavailable" overloaded, tools.py:619),
+pre-registration outage cost, delegation non-str guard, pip-install CLI gap;
+optionally remove the Engram MCP once recall is field-proven.
