@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -72,6 +73,36 @@ PASSIVE_MAX_CAPTURES_PER_TURN = 12
 # its first 1000.
 DELEGATION_TASK_MAX_CHARS = 1000
 DELEGATION_RESULT_MAX_CHARS = 4000
+
+# Compaction. The archived digest is a *summary* of the window being discarded, never
+# the raw transcript — the transcript is exactly what compaction exists to shed.
+PRE_COMPRESS_MAX_CHARS = 4000
+# The recovery text is prepended to the compression summary prompt, so it competes for
+# the very context budget compaction is trying to reclaim. Keep it short.
+RECOVERY_MAX_CHARS = 1500
+_DIGEST_USER_TURNS = 10
+_DIGEST_USER_CHARS = 200
+_DIGEST_ASSISTANT_CHARS = 800
+
+# Total wall-clock ceiling on on_pre_compress. Larger than PREFETCH_BUDGET_S because
+# this runs once per compaction rather than once per turn, and compaction is already a
+# multi-second LLM round-trip the user is waiting on — but still bounded, because it
+# runs on the caller thread. Worst case: project detection (2s read) + the archive
+# write (3s) + the recovery context (2s read, only started when it still fits).
+PRE_COMPRESS_BUDGET_S = 7.0
+
+# How many recently-ended session ids to remember, so an end followed by a switch
+# cannot post /end twice. Bounded: a long-lived gateway process rotates sessions
+# indefinitely, and an unbounded set would be a slow leak.
+_ENDED_SESSION_MEMORY = 64
+
+# Outcome of the compaction archive, which decides what the recovery text tells the
+# model to do. Mirrors gentle-engram's ``ArchiveOutcome`` (compaction-recovery.js),
+# minus its ``unavailable`` state, which covers a Pi-specific "could not identify the
+# runtime session" case that our gates already turn into a plain ``""`` return.
+_ARCHIVE_CONFIRMED = "confirmed"
+_ARCHIVE_FAILED = "failed"
+_ARCHIVE_UNKNOWN = "unknown"
 
 # This provider's own tool names, whose results must never be passively captured.
 # Upstream guards the same way (``if (ENGRAM_TOOL_NAMES.has(toolName.toLowerCase()))
@@ -196,6 +227,12 @@ class RecallProvider(MemoryProvider):
 
         # Capture state, per session.
         self._turn_number: int = 0
+        # Content hash of the last compaction digest archived for this session, so a
+        # compaction that fires twice over the same window writes once.
+        self._last_pre_compress_hash: str = ""
+        # Recently-ended session ids, used as a bounded ordered set (dicts preserve
+        # insertion order) so /end is never posted twice for the same session.
+        self._ended_sessions: dict[str, None] = {}
         # High-water mark into the host's message list: how many messages have
         # already been considered for passive capture. The host hands us the WHOLE
         # conversation every turn, so without this every turn would re-capture every
@@ -438,17 +475,43 @@ class RecallProvider(MemoryProvider):
         self._context_fetched = False
 
     def _reset_session_state(self) -> None:
-        """Forget everything scoped to one session. **This is T5's entry point.**
+        """Forget everything scoped to one session.
 
-        ``on_session_switch`` must call this, not :meth:`_reset_project_cache` alone:
-        a switch can follow a directory change (re-detect the project) *and* starts a
-        fresh transcript, so the passive-capture high-water mark has to go back to
-        zero or the new session's early tool results would be skipped as "already
-        seen". The turn counter is per session for the same reason.
+        Which reset applies to which event:
+
+        ======================  ============  ============  ===========  =========
+        event                   project       context flag  turn caches  hash
+        ======================  ============  ============  ===========  =========
+        switch (reset=True)     re-detect     clear         clear        clear
+        switch (reset=False)    re-detect     clear         clear        clear
+        switch (rewound=True)   keep          keep          clear        keep
+        ======================  ============  ============  ===========  =========
+
+        A switch — ``/reset``, ``/new``, ``/resume``, ``/branch``, compression — can
+        land in a different working directory, so the project is re-detected either
+        way. A rewind keeps the same session and directory; only the per-turn caches
+        are stale. ``_synced_message_count`` goes back to zero here because the new
+        session starts a new transcript, and leaving it high would make the new
+        session's early tool results look "already seen".
         """
         self._reset_project_cache()
+        self._reset_turn_caches()
         self._turn_number = 0
         self._synced_message_count = 0
+        self._last_pre_compress_hash = ""
+
+    def _reset_turn_caches(self) -> None:
+        """Drop state that describes one turn, keeping session and project state.
+
+        This is the rewind case. ``_synced_message_count`` is deliberately **not**
+        zeroed here: the transcript was truncated, but the observations captured from
+        it are already in Engram, and re-capturing them would duplicate. The mark is
+        instead clamped down to the list's real length by :meth:`_collect_captures`
+        the next time a shorter list shows up.
+        """
+        self._invalidate_prefetch_cache()
+        self._last_recall_count = 0
+        self._last_recall_injected = False
 
     def _invalidate_prefetch_cache(self) -> None:
         """Drop the queued-prefetch cache. Exposed for T5's session-switch hook."""
@@ -863,6 +926,220 @@ class RecallProvider(MemoryProvider):
             return False
         return bool(self._session_id)
 
+    # -- Session lifecycle ---------------------------------------------------
+
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        """Close the session's record in Engram. Never raises.
+
+        Sends an **empty** summary, deliberately. Upstream gentle-engram does the
+        same — its ``/sessions/{id}/end`` body is ``{"summary": ""}`` and it never
+        synthesises one — because the meaningful end-of-session artifact is the
+        model-authored ``mem_session_summary``, written while the model still has the
+        conversation in context. A provider-side digest of the transcript would be a
+        second, worse summary competing with it for the same topic.
+
+        ``messages`` is therefore unused: closing a session needs no transcript, and
+        the one place we *do* digest a transcript is :meth:`on_pre_compress`, where
+        the transcript is about to be destroyed and nothing else will preserve it.
+        """
+        try:
+            if not self._write_gate_open():
+                return
+
+            session_id = self._session_id
+            # Recorded synchronously, not from the worker: the host submits
+            # on_session_end and on_session_switch as one background task, back to
+            # back, so the switch's de-duplication check can run before our worker
+            # has picked the end job up.
+            self._remember_ended_session(session_id)
+
+            def job() -> None:
+                self._client.end_session(session_id, summary="")
+
+            self._submit("session-end", job)
+        except Exception:
+            logger.debug("recall on_session_end failed (non-fatal)", exc_info=True)
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Re-bind every piece of per-session state to the new session id. Never raises.
+
+        Fires on ``/resume``, ``/branch``, ``/reset``, ``/new``, their gateway
+        equivalents and context compression. ``**kwargs`` absorbs what the host adds
+        per path (it forwards ``reason`` on the rotation path, and ``rewound`` only
+        when true), so nothing here depends on an exact kwargs shape.
+        """
+        try:
+            previous_session_id = self._session_id
+            unchanged = bool(new_session_id) and new_session_id == previous_session_id
+
+            if rewound and unchanged:
+                # The transcript was truncated but the session and directory are the
+                # same: the record stays open, nothing is re-registered, and only the
+                # per-turn caches are stale.
+                logger.debug("recall: session %s rewound; dropping turn caches", new_session_id)
+                self._reset_turn_caches()
+                return
+
+            if reset:
+                self._end_outgoing_session(previous_session_id, new_session_id)
+
+            self._session_id = new_session_id or ""
+            self._reset_session_state()
+
+            if self._session_id:
+                logger.debug(
+                    "recall: switched to session %s (reset=%s, parent=%r)",
+                    self._session_id,
+                    reset,
+                    parent_session_id,
+                )
+                # Same code path initialize() uses, so registration cannot drift
+                # between "first session" and "every session after it".
+                self._submit("register-session", self._register_session)
+        except Exception:
+            logger.debug("recall on_session_switch failed (non-fatal)", exc_info=True)
+
+    def _end_outgoing_session(self, previous_session_id: str, new_session_id: str) -> None:
+        """End the session being left behind, at most once.
+
+        ``reset=True`` means a genuinely new conversation, so the old one is over and
+        its record should be closed rather than left open forever.
+
+        The de-duplication matters because of the host's ordering: on the rotation
+        path ``MemoryManager`` submits ``on_session_end`` and then
+        ``on_session_switch(..., reset=True)`` as a single background task, in that
+        exact order. Without the check, every ``/reset`` would post ``/end`` twice for
+        the same session.
+        """
+        if not previous_session_id or previous_session_id == new_session_id:
+            return
+        if not self._writes_enabled or not self._config.enabled:
+            return
+        if previous_session_id in self._ended_sessions:
+            logger.debug("recall: session %s already ended; not ending twice", previous_session_id)
+            return
+
+        self._remember_ended_session(previous_session_id)
+
+        def job() -> None:
+            self._client.end_session(previous_session_id, summary="")
+
+        self._submit("session-end", job)
+
+    def _remember_ended_session(self, session_id: str) -> None:
+        """Note that a session's ``/end`` has been issued, keeping the set bounded."""
+        if not session_id:
+            return
+        self._ended_sessions[session_id] = None
+        while len(self._ended_sessions) > _ENDED_SESSION_MEMORY:
+            self._ended_sessions.pop(next(iter(self._ended_sessions)))
+
+    # -- Compaction ----------------------------------------------------------
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        """Archive a digest of the window about to be discarded, and return recovery text.
+
+        Two jobs, in order: persist something that survives the compaction, then tell
+        the model what it needs to know about what just happened.
+
+        **The archive write is synchronous**, unlike every other write in this
+        provider. The reason is the return value: the recovery text has to tell the
+        model either "it is already saved, do nothing" or "save it yourself now", and
+        a queued write makes both of those claims unprovable — the honest answer would
+        always be "I cannot tell, go and check", which costs the model a verification
+        search after every single compaction. Doing the write here, inside a bounded
+        budget (:data:`PRE_COMPRESS_BUDGET_S`), buys a truthful answer. Compaction is
+        rare and already a multi-second LLM round-trip, so the cost lands where there
+        is room for it.
+
+        Returns ``""`` when there is nothing we can contribute, which for a v1
+        provider is the correct degraded behaviour: the host simply joins nothing.
+        """
+        try:
+            if not self._write_gate_open():
+                return ""
+
+            deadline = time.monotonic() + PRE_COMPRESS_BUDGET_S
+            session_id = self._session_id
+
+            project = self._ensure_project()
+            if not project:
+                logger.debug("recall: no project at compaction; contributing nothing")
+                return ""
+
+            outcome = self._archive_compaction_digest(session_id, project, messages, deadline)
+            context = self._compaction_context(session_id, deadline)
+            return _build_recovery_notice(project, context, outcome)
+        except Exception:
+            logger.debug("recall on_pre_compress failed (non-fatal)", exc_info=True)
+            return ""
+
+    def _archive_compaction_digest(
+        self,
+        session_id: str,
+        project: str,
+        messages: list[dict[str, Any]] | None,
+        deadline: float | None,
+    ) -> str:
+        """Post the compaction digest and report how it went.
+
+        Idempotent by content hash: compaction can fire more than once over the same
+        window, and a second identical ``session_summary`` is noise in the user's
+        store. A repeat is reported as ``confirmed`` because the content *is* already
+        archived — which is exactly what the model needs to know.
+        """
+        content = _compose_compaction_digest(messages)
+        if not content:
+            return _ARCHIVE_FAILED
+
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if digest == self._last_pre_compress_hash:
+            logger.debug("recall: compaction digest unchanged; already archived")
+            return _ARCHIVE_CONFIRMED
+
+        if not _room_for_call(deadline, client_module.WRITE_TIMEOUT_S):
+            # Never attempted, so nothing was written — but say "unknown" rather than
+            # "failed": the model's safe move is to verify before saving, and claiming
+            # a definite failure would invite a duplicate if an earlier compaction had
+            # in fact archived something.
+            logger.debug("recall: no budget to archive the compaction digest")
+            return _ARCHIVE_UNKNOWN
+
+        saved = self._client.add_observation(
+            session_id,
+            "Compaction recovery summary",
+            content,
+            type_="session_summary",
+            project=project,
+            scope="project",
+            topic_key="session/compaction-recovery",
+        )
+        if isinstance(saved, dict):
+            self._last_pre_compress_hash = digest
+            return _ARCHIVE_CONFIRMED
+
+        # A write that timed out may still have been committed server-side, so it is
+        # genuinely ambiguous; anything else (refused, rejected, 4xx/5xx) definitely
+        # was not written.
+        if client_module.TIMEOUT_ERROR_MARKER in self._client.last_error_text():
+            return _ARCHIVE_UNKNOWN
+        return _ARCHIVE_FAILED
+
+    def _compaction_context(self, session_id: str, deadline: float | None) -> str:
+        """Fetch this session's compaction context, capped; ``""`` when unavailable."""
+        if not _room_for_call(deadline):
+            logger.debug("recall: no budget for the compaction context")
+            return ""
+        return truncate(self._client.compaction_context(session_id), RECOVERY_MAX_CHARS)
+
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -900,22 +1177,24 @@ def _deadline_passed(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
-def _room_for_call(deadline: float | None) -> bool:
+def _room_for_call(deadline: float | None, timeout_s: float | None = None) -> bool:
     """Whether a *skippable* client call still fits inside the budget.
 
     Stricter than :func:`_deadline_passed`: it demands enough remaining budget for a
-    whole read timeout, so an optional call can never be the reason the total
-    overruns the deadline. "The deadline has not passed yet" is not enough for that —
-    a call started one millisecond before it can still run for the full timeout, and
-    the sum would be ``PREFETCH_BUDGET_S + READ_TIMEOUT_S``, which is the bound this
-    budget exists to remove.
+    whole timeout, so an optional call can never be the reason the total overruns the
+    deadline. "The deadline has not passed yet" is not enough for that — a call started
+    one millisecond before it can still run for the full timeout, and the sum would be
+    ``budget + timeout``, which is the bound a budget exists to remove.
 
-    ``READ_TIMEOUT_S`` is read through the client module namespace at call time, not
-    bound at import, so a test that monkeypatches it is actually honoured.
+    ``timeout_s`` defaults to the client's read timeout; a write costs more, so the
+    caller passes ``WRITE_TIMEOUT_S``. Both are read through the client module
+    namespace at call time, not bound at import, so a test that monkeypatches them is
+    actually honoured.
     """
     if deadline is None:
         return True
-    return (deadline - time.monotonic()) >= client_module.READ_TIMEOUT_S
+    budget = client_module.READ_TIMEOUT_S if timeout_s is None else timeout_s
+    return (deadline - time.monotonic()) >= budget
 
 
 def _working_directory() -> str:
@@ -1001,6 +1280,84 @@ def _compose_delegation(task: str, result: str) -> str:
     task_text = truncate(task if isinstance(task, str) else "", DELEGATION_TASK_MAX_CHARS)
     result_text = truncate(result if isinstance(result, str) else "", DELEGATION_RESULT_MAX_CHARS)
     return f"**Delegated task**: {task_text}\n\n**Subagent result**: {result_text}"
+
+
+def _compose_compaction_digest(messages: list[dict[str, Any]] | None) -> str:
+    """Summarise the window about to be discarded, bounded and redacted.
+
+    A digest, not the transcript: the transcript is what compaction exists to shed, and
+    re-posting it whole would just move the problem into the user's memory store. What
+    survives is the shape of the conversation — how long it ran, what the user asked,
+    and where the assistant left off — which is what someone resuming needs.
+    """
+    rows = [m for m in (messages or []) if isinstance(m, dict)]
+
+    user_turns = [
+        text
+        for text in (_collapse(r.get("content")) for r in rows if r.get("role") == "user")
+        if text
+    ]
+    assistant_replies = [
+        text
+        for text in (_collapse(r.get("content")) for r in rows if r.get("role") == "assistant")
+        if text
+    ]
+
+    if not user_turns and not assistant_replies:
+        return ""
+
+    lines = [
+        "**What**: transcript window compacted before it was discarded.",
+        f"**Messages**: {len(rows)}",
+    ]
+    if user_turns:
+        lines.append("**User asked**:")
+        for turn in user_turns[-_DIGEST_USER_TURNS:]:
+            lines.append(f"- {truncate(turn, _DIGEST_USER_CHARS)}")
+    if assistant_replies:
+        last = truncate(assistant_replies[-1], _DIGEST_ASSISTANT_CHARS)
+        lines.append(f"**Last assistant reply**: {last}")
+
+    return truncate(strip_private("\n".join(lines)), PRE_COMPRESS_MAX_CHARS)
+
+
+def _collapse(content: Any) -> str:
+    """Collapse a message's text content to one whitespace-normalised line, else ``""``."""
+    if not isinstance(content, str):
+        return ""
+    return " ".join(content.split())
+
+
+def _build_recovery_notice(project: str, context: str, outcome: str) -> str:
+    """Compose the text handed back to the compression summary prompt.
+
+    The instruction is chosen by archive outcome, adapted from gentle-engram's
+    ``buildRecoveryNotice`` (compaction-recovery.js) — the same three decisions,
+    reworded rather than copied, since the upstream strings name gentle-engram and Pi's
+    own tooling.
+    """
+    if outcome == _ARCHIVE_CONFIRMED:
+        instruction = (
+            f"A compaction recovery summary for '{project}' is already saved in Engram. "
+            "Do NOT call mem_session_summary for this compaction — it would duplicate "
+            "the record. Call mem_context if you need more recent project memory."
+        )
+    elif outcome == _ARCHIVE_UNKNOWN:
+        instruction = (
+            f"Whether the compaction recovery summary reached Engram ('{project}') could "
+            "not be confirmed. Do NOT retry or call mem_session_summary yet, because "
+            "that could duplicate the summary. Verify with mem_search first, and save it "
+            "only if it is genuinely absent."
+        )
+    else:
+        instruction = (
+            "CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\n"
+            f"The compaction recovery summary was NOT saved to Engram ('{project}'). "
+            "FIRST ACTION REQUIRED: call mem_session_summary with the content of this "
+            "compacted summary, before any other work."
+        )
+    trimmed = context.strip() if isinstance(context, str) else ""
+    return f"{trimmed}\n\n{instruction}" if trimmed else instruction
 
 
 def _user_instruction(message: Any) -> str | None:

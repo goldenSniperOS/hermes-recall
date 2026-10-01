@@ -972,27 +972,30 @@ def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
 # -- 11. inherited hooks stay inherited ---------------------------------------
 
 
-@pytest.mark.parametrize(
-    "hook",
-    [
-        "on_session_switch",
-        "on_session_end",
-        "on_pre_compress",
-        "handle_tool_call",
-    ],
-)
+@pytest.mark.parametrize("hook", ["handle_tool_call"])
 def test_lifecycle_hooks_are_still_inherited(hook: str) -> None:
-    """T5/T6 own these; they must not be stubbed early with wrong behaviour.
+    """T6 owns what is left; it must not be stubbed early with wrong behaviour.
 
-    ``on_turn_start``, ``sync_turn`` and ``on_delegation`` left this list in T4,
-    which implemented them — see tests/test_capture.py.
+    ``on_turn_start``, ``sync_turn`` and ``on_delegation`` left this list in T4;
+    ``on_session_end``, ``on_session_switch`` and ``on_pre_compress`` left it in T5.
+    See tests/test_capture.py and tests/test_lifecycle.py.
     """
     assert hook not in vars(RecallProvider), f"{hook} was implemented early"
 
 
-@pytest.mark.parametrize("hook", ["on_turn_start", "sync_turn", "on_delegation"])
-def test_capture_hooks_are_implemented(hook: str) -> None:
-    """The other half of the above: T4's hooks must be real overrides, not inherited."""
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "on_turn_start",
+        "sync_turn",
+        "on_delegation",
+        "on_session_end",
+        "on_session_switch",
+        "on_pre_compress",
+    ],
+)
+def test_capture_and_lifecycle_hooks_are_implemented(hook: str) -> None:
+    """The other half: every hook T4/T5 own must be a real override, not inherited."""
     assert hook in vars(RecallProvider), f"{hook} is still the inherited no-op"
 
 

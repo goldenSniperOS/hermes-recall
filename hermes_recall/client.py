@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 READ_TIMEOUT_S = 2.0
 WRITE_TIMEOUT_S = 3.0
 
+# Marker the recorded reason carries when a request was abandoned on a timeout, as
+# opposed to refused or rejected. The distinction is not cosmetic: a POST that timed
+# out may still have been committed server-side, so a caller deciding whether to tell
+# the model "save it yourself" has to tell "definitely not written" apart from "might
+# have been written". Every method collapses failures to the same empty value, so this
+# is the only channel that carries it. Upstream gentle-engram draws the same line with
+# ``result.transportFailure?.outcome === "unknown"``.
+TIMEOUT_ERROR_MARKER = "timed out"
+
 # Keys `PATCH /observations/{id}` accepts, mapped to the client kwarg name.
 _UPDATABLE_FIELDS = ("type", "title", "content", "find", "replace", "project", "scope", "topic_key")
 
@@ -145,7 +154,7 @@ class EngramClient:
             self._record_error(f"{method} {path}: unreachable ({exc.reason})")
             return None
         except TimeoutError:
-            self._record_error(f"{method} {path}: timed out after {timeout:g}s")
+            self._record_error(f"{method} {path}: {TIMEOUT_ERROR_MARKER} after {timeout:g}s")
             return None
         except OSError as exc:
             self._record_error(f"{method} {path}: OS error ({exc})")
