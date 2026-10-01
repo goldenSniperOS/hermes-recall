@@ -674,3 +674,18 @@ def test_memory_tool_results_are_never_passively_captured() -> None:
     from hermes_recall import provider as provider_module
 
     assert provider_module._MEMORY_TOOL_NAMES == tools_module.TOOL_NAMES
+
+
+# -- state.json is written from the primary context only -----------------------
+
+
+@pytest.mark.parametrize("agent_context", ["subagent", "cron", "flush"])
+def test_non_primary_read_tools_do_not_write_state(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path, agent_context: str
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url, agent_context=agent_context)
+
+    assert call(provider, "mem_get_observation", id=761)["id"] == 761
+
+    assert not state_path(tmp_path).exists()

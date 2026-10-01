@@ -831,3 +831,48 @@ def test_client_without_an_explicit_config_loads_one(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(client_module, "load_config", lambda: sentinel)
 
     assert EngramClient().base_url == "http://sentinel:1"
+
+
+# -- loopback never goes through an HTTP(S) proxy --------------------------------
+
+
+def _proxy_handlers(client: EngramClient) -> list[Any]:
+    import urllib.request
+
+    return [h for h in client._opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:7437", "http://localhost:7437", "http://[::1]:7437"]
+)
+def test_a_loopback_client_has_no_proxies(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+
+    handlers = _proxy_handlers(EngramClient(make_config(url)))
+
+    # An empty ProxyHandler registers no ``<scheme>_open`` method, so the opener
+    # drops it; what matters is that no environment-derived proxy survived.
+    assert all(h.proxies == {} for h in handlers), [h.proxies for h in handlers]
+
+
+def test_a_remote_client_keeps_the_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+
+    handlers = _proxy_handlers(EngramClient(make_config("http://engram.example:7437")))
+
+    assert any(h.proxies.get("http") == "http://proxy.invalid:3128" for h in handlers)
+
+
+def test_a_loopback_request_bypasses_a_configured_proxy(
+    fake_engram: FakeEngram, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_engram.route("GET", "/health", (200, {"status": "ok"}))
+    with FakeEngram(default_response=(502, {"error": "proxied"})) as proxy:
+        for key in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HTTP_PROXY", proxy.base_url)
+        monkeypatch.setenv("http_proxy", proxy.base_url)
+
+        assert client_for(fake_engram).health() == {"status": "ok"}
+        assert proxy.requests == []

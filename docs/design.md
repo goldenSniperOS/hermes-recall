@@ -29,12 +29,13 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 
 | Hermes surface | Engram endpoint | Notes |
 | --- | --- | --- |
-| `initialize` | `GET /project/current?cwd=`, `POST /sessions` | Background; primary context only |
-| `prefetch` / `queue_prefetch` | `GET /search`, `GET /context` (once per session) | Trivial prompts skipped; 4 s budget |
+| `initialize` | `GET /project/current?cwd=`, `POST /sessions` | Background; primary context only; retried by later writes if it fails |
+| `prefetch` | `GET /search`, `GET /context` (once per session) | Trivial prompts skipped; 4 s budget |
+| `queue_prefetch` | `GET /project/current` (until detected) | Warms project detection only; no search, never consumes the `/context` flag |
 | `recall_status` | — | `🧠 Recall · <project> — recalled N memories`, rendered by Hermes |
 | `on_turn_start` | `POST /prompts` | `<private>` redacted, 2000-char cap |
-| `sync_turn` | `POST /observations/passive` | Tool results + assistant text, ≤ 12 per turn |
-| `on_delegation` | `POST /observations/passive` (`source=subagent`) | |
+| `sync_turn` | `POST /observations/passive` | Tool results + assistant text, ≤ 12 per turn; skips `mem_*`, `mcp__engram__*`, `mcp_engram_*` results |
+| `on_delegation` | `POST /observations/passive` (`source=subagent`) | Task / result redacted, then capped at 1000 / 4000 chars |
 | `on_pre_compress` | `POST /observations` (`session_summary`), `GET /context/compaction` | Synchronous, 7 s budget, idempotent by hash |
 | `on_session_switch` / `on_session_end` | `POST /sessions`, `POST /sessions/{id}/end` | `/end` de-duplicated |
 | `mem_search` | `GET /search` | Default project = detected project |
@@ -93,8 +94,8 @@ Other plugins depend on this file (hermes-odd reads `last_memory_id`). It is a
 - **Atomicity:** written to a temp file in the same directory, `fsync`ed, then
   `os.replace`d over the target. Readers never see a partial file.
 - **When:** after every successful `mem_save`, `mem_session_summary`,
-  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin`. Write failures are
-  swallowed; the tool result is unaffected.
+  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin` in the primary agent
+  context. Write failures are swallowed; the tool result is unaffected.
 - **API:**
 
   ```python
@@ -176,15 +177,56 @@ not `hermes recall`.
   JSON error.
 - `is_available()` makes no network call.
 - One daemon worker thread runs every background job (session registration,
-  prompt and passive capture, queued prefetch, `/end`) in order, behind a bounded
-  queue (256). A full queue drops the job. `shutdown()` joins for at most 2 s.
+  prompt and passive capture, queued project detection, `/end`) in order, behind a
+  bounded queue (256). A full queue drops the job. `shutdown()` joins for at most 2 s.
 - Tools and `on_pre_compress` run on the caller's thread. `mem_save` may register
   the session synchronously when Engram has not seen it yet.
+- `queue_prefetch` does not search. Hermes calls it with the turn that just
+  finished, while the next `prefetch` asks about the next message, so a recall
+  computed in the background would almost never be served. It only warms project
+  detection; the first non-trivial `prefetch` still fetches `/context`.
 - `EngramClient.last_error_text()` is per thread, so the worker and the tool
   thread cannot overwrite each other's failure reason.
 - Non-primary `agent_context` (`subagent`, `cron`, `flush`): no capture and no
   session writes; write tools (`mem_save`, `mem_update`, `mem_session_summary`,
-  `mem_judge`, `mem_pin`, `mem_unpin`) return an error. Read tools work.
+  `mem_judge`, `mem_pin`, `mem_unpin`) return an error. Read tools work and do not
+  write `state.json`.
+
+## Session registration
+
+Engram rejects a write that names a project when it has no row for the session
+(`validateSessionProject`, `server.go`: 404 `session not found`). The `POST
+/sessions` from `initialize` or a session switch fails whenever Engram is down or
+the project cannot be resolved yet, so registration is not a one-shot:
+
+- The provider remembers the session id Engram last confirmed. A switch clears it.
+- Before each background write (prompt, passive capture, delegation) and the
+  compaction archive, an unconfirmed session is registered first.
+- A write that still answers `session not found` registers and retries once,
+  through the same helper `mem_save` uses (`tools.with_session_retry`).
+- Each job posts `/sessions` at most once, however many captures it carries. At
+  compaction, registration only starts when it and the archive write both fit in
+  the 7 s budget.
+
+## Capture high-water mark
+
+`sync_turn` receives the whole transcript every turn and captures only messages
+past a high-water mark. After startup or a session switch (`/resume`, `/new`,
+compression) the next transcript may carry history from an earlier session, so
+the first `sync_turn` starts at the last user message: only the turn that just
+ran is captured. A genuinely new transcript has its only user message first, so
+nothing of it is skipped. A rewind keeps the mark.
+
+## Privacy
+
+- `<private>…</private>` blocks are redacted on the full raw text **before** any
+  truncation: prompts (2000), delegation task / result (1000 / 4000) and every
+  compaction digest row (200 per user turn, 800 for the last reply). A cut can
+  therefore never split a block and store its head. Passive tool results are
+  redacted and not truncated.
+- For a loopback Engram URL (`127.0.0.1`, `::1`, `localhost`) the client's opener
+  has an empty `ProxyHandler`, so `HTTP_PROXY` / `HTTPS_PROXY` never see memory
+  content. A remote URL keeps the environment's proxies.
 
 ## Limits and caps
 

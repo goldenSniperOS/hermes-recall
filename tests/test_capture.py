@@ -892,3 +892,161 @@ def test_capture_hooks_never_raise_on_garbage_input(
     provider.on_delegation(None, None, child_session_id=None)  # type: ignore[arg-type]
 
     assert provider._drain_for_test()
+
+
+# -- 6. redaction runs before every truncation ----------------------------------
+
+SECRET = "SECRETZ"
+
+
+def private_straddling(cut: int, *, filler: str = "a") -> str:
+    """Text whose ``<private>`` block opens just before ``cut`` and closes well after it."""
+    return filler * (cut - 20) + "<private>" + SECRET * 100 + "</private>" + "b" * 300
+
+
+@pytest.mark.parametrize(
+    ("task", "result"),
+    [
+        (private_straddling(DELEGATION_TASK_MAX_CHARS), "found the issue in the loader"),
+        ("look at the loader please", private_straddling(DELEGATION_RESULT_MAX_CHARS)),
+    ],
+    ids=["task-cut", "result-cut"],
+)
+def test_on_delegation_does_not_leak_a_block_straddling_a_cap(
+    fake_engram: FakeEngram, provider_factory: Any, task: str, result: str
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    provider.on_delegation(task, result)
+    assert provider._drain_for_test()
+
+    content = passive_requests(fake_engram)[0].json_body["content"]
+    assert "SECRET" not in content, "the straddling private block leaked"
+    assert REDACTED in content
+
+
+# -- 7. session registration is retried when initialize could not register ------
+
+
+def test_a_session_unregistered_at_initialize_registers_on_the_next_write(
+    provider_factory: Any,
+) -> None:
+    # Engram is down at initialize, so POST /sessions never lands; it comes up later.
+    port = unused_port()
+    provider = provider_factory(f"http://127.0.0.1:{port}")
+    with FakeEngram(port=port) as fake:
+        wire_engram(fake)
+        registered: set[str] = set()
+
+        def sessions(request: RecordedRequest) -> tuple[int, Any]:
+            registered.add(request.json_body["id"])
+            return (201, {"id": request.json_body["id"], "status": "created"})
+
+        def needs_session(status: int, payload: Any) -> Any:
+            def route(request: RecordedRequest) -> tuple[int, Any]:
+                if request.json_body["session_id"] not in registered:
+                    return (404, {"error": "session not found"})
+                return (status, payload)
+
+            return route
+
+        fake.route("POST", "/sessions", sessions)
+        fake.route("POST", "/prompts", needs_session(201, {"id": 12, "status": "saved"}))
+        fake.route(
+            "POST",
+            "/observations/passive",
+            needs_session(200, {"extracted": 1, "saved": 1, "duplicates": 0}),
+        )
+
+        provider.on_turn_start(1, "why does the loader skip my provider")
+        provider.sync_turn(
+            "ask", "", session_id=SESSION, messages=[tool_message(long_text("r"), name="read")]
+        )
+        assert provider._drain_for_test()
+
+        prompts = [r for r in fake.requests if r.path == "/prompts"]
+        assert [r.json_body["content"] for r in prompts] == ["why does the loader skip my provider"]
+        assert captured(fake) == [("read", long_text("r"))]
+        assert sum(1 for r in fake.requests if r.path == "/sessions") == 1
+
+
+def test_a_session_not_found_write_registers_and_retries_exactly_once(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    fake_engram.route("POST", "/prompts", (404, {"error": "session not found"}))
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    provider.on_turn_start(1, "why does the loader skip my provider")
+    assert provider._drain_for_test()
+
+    paths = [r.path for r in fake_engram.requests if r.method == "POST"]
+    assert paths == ["/prompts", "/sessions", "/prompts"], paths
+
+
+def test_a_session_not_found_write_lands_after_the_retry(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    attempts: list[int] = []
+
+    def passive(_request: RecordedRequest) -> tuple[int, Any]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return (404, {"error": "session not found"})
+        return (200, {"extracted": 1, "saved": 1, "duplicates": 0})
+
+    fake_engram.route("POST", "/observations/passive", passive)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    provider.on_delegation("look at the loader please", long_text("r"))
+    assert provider._drain_for_test()
+
+    assert len(attempts) == 2
+    assert sum(1 for r in fake_engram.requests if r.path == "/sessions") == 1
+
+
+# -- 8. MCP Engram tool results are never passively captured --------------------
+
+
+@pytest.mark.parametrize("name", ["mcp__engram__mem_search", "mcp_engram_mem_save"])
+def test_sync_turn_skips_mcp_engram_tool_results(
+    fake_engram: FakeEngram, provider_factory: Any, name: str
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+    messages = [
+        tool_message(long_text("m"), name=name),
+        tool_message(long_text("r"), name="read_file"),
+    ]
+
+    provider.sync_turn("ask", "", session_id=SESSION, messages=messages)
+    assert provider._drain_for_test()
+
+    assert captured(fake_engram) == [("read_file", long_text("r"))]
+
+
+def test_the_first_sync_after_startup_skips_a_resumed_transcript(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    # Starting Hermes on a resumed session hands the first sync_turn the whole old
+    # conversation; its tool results were captured by the run that produced them.
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+    messages = [
+        {"role": "user", "content": "an old question"},
+        tool_message(long_text("o"), name="read_file"),
+        {"role": "user", "content": "the new question"},
+        tool_message(long_text("n"), name="read_file"),
+    ]
+
+    provider.sync_turn("ask", "", session_id=SESSION, messages=messages)
+    assert provider._drain_for_test()
+
+    assert captured(fake_engram) == [("read_file", long_text("n"))]

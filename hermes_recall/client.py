@@ -66,6 +66,7 @@ class EngramClient:
         # as the other's. Every caller reads the reason on the thread that made
         # the call.
         self._errors = threading.local()
+        self._opener = _build_opener(self._base_url)
 
     # -- Introspection -------------------------------------------------------
 
@@ -137,7 +138,7 @@ class EngramClient:
 
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read()
             self._errors.message = ""
             if not raw:
@@ -446,6 +447,30 @@ class EngramClient:
         elif project.strip():
             params["project"] = project
         return _as_dict(self._request("GET", "/stats", params=params))
+
+
+# Hosts that name this machine. Requests to them never need a proxy, and must not
+# use one: the bodies carry memory content (prompts, tool results, observations).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _build_opener(base_url: str) -> urllib.request.OpenerDirector:
+    """Return the opener for ``base_url``: proxy-free for loopback, default otherwise.
+
+    urllib's default opener honours ``HTTP_PROXY`` / ``HTTPS_PROXY`` for every
+    host, including ``127.0.0.1`` unless ``NO_PROXY`` happens to list it. A local
+    Engram is the common case, and routing it through a corporate or debugging
+    proxy would hand that proxy every memory write. An explicit empty
+    ``ProxyHandler`` replaces the environment-derived one. A remote Engram keeps
+    the environment's proxies, since reaching it may genuinely require them.
+    """
+    try:
+        host = (urllib.parse.urlsplit(base_url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host in _LOOPBACK_HOSTS:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
 
 
 def _query_value(value: Any) -> str:

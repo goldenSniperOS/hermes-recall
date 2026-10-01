@@ -589,22 +589,6 @@ def test_a_context_fetch_that_failed_is_not_retried(
     assert count_requests(fake_engram, "GET", "/search") == 3
 
 
-def test_queue_prefetch_runs_without_a_deadline(
-    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The background job is off the turn's critical path, so a spent turn budget
-    # must not stop it from fetching the project context.
-    monkeypatch.setattr(provider_module, "PREFETCH_BUDGET_S", 0.0)
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-
-    assert count_requests(fake_engram, "GET", "/search") == 1
-    assert count_requests(fake_engram, "GET", "/context") == 1
-
-
 def test_a_zero_budget_turn_recalls_nothing_and_reports_nothing(
     fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -619,26 +603,6 @@ def test_a_zero_budget_turn_recalls_nothing_and_reports_nothing(
     assert provider.prefetch("a second real question about the loader") == ""
 
     assert provider.recall_status() is None
-    assert fake_engram.requests == []
-
-
-def test_a_spent_budget_still_serves_a_cached_recall(
-    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The budget bounds network work. A queued result is already in hand, so
-    # withholding it would cost the user recall for no benefit at all.
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-    fake_engram.reset()
-
-    monkeypatch.setattr(provider_module, "PREFETCH_BUDGET_S", -1.0)
-    text = provider.prefetch("why does the loader skip my provider")
-
-    assert "#761" in text
-    status = provider.recall_status()
-    assert status is not None and status.count == 1
     assert fake_engram.requests == []
 
 
@@ -809,52 +773,6 @@ def test_recall_status_reports_zero_for_a_context_only_block(
 # -- 8. queue_prefetch --------------------------------------------------------
 
 
-def test_queue_prefetch_serves_the_next_prefetch_from_cache(
-    fake_engram: FakeEngram, provider_factory: Any
-) -> None:
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-    assert count_requests(fake_engram, "GET", "/search") == 1
-
-    text = provider.prefetch("why does the loader skip my provider")
-
-    assert "#761" in text
-    assert count_requests(fake_engram, "GET", "/search") == 1, "cached result was not used"
-    status = provider.recall_status()
-    assert status is not None and status.count == 1
-
-
-def test_queue_prefetch_cache_is_never_served_for_a_different_query(
-    fake_engram: FakeEngram, provider_factory: Any
-) -> None:
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-
-    provider.prefetch("something else entirely about the client")
-
-    assert count_requests(fake_engram, "GET", "/search") == 2
-
-
-def test_queue_prefetch_normalises_the_query_key(
-    fake_engram: FakeEngram, provider_factory: Any
-) -> None:
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-
-    provider.queue_prefetch("   why does the loader skip my provider   ")
-    assert provider._drain_for_test()
-
-    provider.prefetch("why does the loader skip my provider")
-
-    assert count_requests(fake_engram, "GET", "/search") == 1
-
-
 @pytest.mark.parametrize("trivial", ["", "  ", "ok", "/reset", "thanks"])
 def test_queue_prefetch_skips_trivial_queries(
     fake_engram: FakeEngram, provider_factory: Any, trivial: str
@@ -887,20 +805,6 @@ def test_queue_prefetch_does_not_raise_with_no_server_listening(provider_factory
 
     assert provider._drain_for_test()
     assert provider.prefetch("a real question about the loader") == ""
-
-
-def test_invalidating_the_cache_forces_a_fresh_search(
-    fake_engram: FakeEngram, provider_factory: Any
-) -> None:
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-
-    provider._invalidate_prefetch_cache()
-    provider.prefetch("why does the loader skip my provider")
-
-    assert count_requests(fake_engram, "GET", "/search") == 2
 
 
 # -- 9. shutdown and worker ---------------------------------------------------
@@ -1000,3 +904,46 @@ def test_capture_and_lifecycle_hooks_are_implemented(hook: str) -> None:
 
 def test_pre_compress_checkpoint_api_version_is_one() -> None:
     assert RecallProvider.pre_compress_checkpoint_api_version == 1
+
+
+# -- 11. queue_prefetch only warms cheap state -----------------------------------
+
+
+def test_queue_prefetch_does_not_consume_the_first_turn_context(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    # Hermes queues the turn that just FINISHED; the next prefetch asks a different
+    # question. A background search keyed on the old turn is wasted work, and must
+    # never swallow the once-per-session /context.
+    wire_engram(fake_engram, context="## Recent\n- shipped the client")
+    provider = provider_factory(fake_engram.base_url)
+
+    provider.queue_prefetch("why does the loader skip my provider")
+    assert provider._drain_for_test()
+
+    assert count_requests(fake_engram, "GET", "/search") == 0
+    assert count_requests(fake_engram, "GET", "/context") == 0
+    assert provider._context_fetched is False
+
+    text = provider.prefetch("something else entirely about the client")
+
+    assert "shipped the client" in text
+    assert count_requests(fake_engram, "GET", "/context") == 1
+
+
+def test_queue_prefetch_warms_project_detection(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+
+    provider.queue_prefetch("why does the loader skip my provider")
+    assert provider._drain_for_test()
+
+    assert provider._project == PROJECT
+    assert count_requests(fake_engram, "GET", "/project/current") == 1
+    fake_engram.reset()
+
+    provider.prefetch("why does the loader skip my provider")
+
+    assert count_requests(fake_engram, "GET", "/project/current") == 0

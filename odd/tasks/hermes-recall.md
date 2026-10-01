@@ -51,17 +51,17 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
 
 ## Tasks
 
-- [ ] T1 Scaffold: plugin.yaml (kind exclusive), root `__init__.py` + package, pyproject,
+- [x] T1 Scaffold: plugin.yaml (kind exclusive), root `__init__.py` + package, pyproject,
       CI/release workflows, LICENSE, version-sync tests. Route: delegated (OpenCode).
-- [ ] T2 Engram HTTP client + project detection (`GET /project/current?cwd=`), health,
+- [x] T2 Engram HTTP client + project detection (`GET /project/current?cwd=`), health,
       timeouts, fail-soft. Route: delegated.
-- [ ] T3 Provider core: availability, initialize (session register), system prompt
+- [x] T3 Provider core: availability, initialize (session register), system prompt
       block, prefetch with caps + recall_status, queue_prefetch. Route: delegated.
-- [ ] T4 Capture: on_turn_start prompt capture, sync_turn passive capture (tool results
+- [x] T4 Capture: on_turn_start prompt capture, sync_turn passive capture (tool results
       + assistant text), on_delegation. Background worker. Route: delegated.
-- [ ] T5 Lifecycle: on_session_switch, on_session_end, on_pre_compress (archive summary,
+- [x] T5 Lifecycle: on_session_switch, on_session_end, on_pre_compress (archive summary,
       recovery context). Route: delegated.
-- [ ] T6 Tools: compact mem_* schemas + handle_tool_call; 🧠 saved #id status; last id
+- [x] T6 Tools: compact mem_* schemas + handle_tool_call; 🧠 saved #id status; last id
       state file. Route: delegated.
 - [ ] T7 Docs + credits + install prompt; real install in throwaway HERMES_HOME; v0.1.0
       release; public repo. Route: inline.
@@ -98,8 +98,27 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 
 ## Progress
 
-(per task: commit ids)
+- T1 scaffold: `15e93a0` (OpenCode writer).
+- T2 Engram client: `2e98c45` (OpenCode writer).
+- T3 provider core: `727d6d0` (OpenCode writer).
+- T4 capture: `85ebc54` (OpenCode writer).
+- T5 lifecycle: `6b3e8b8` (OpenCode WIP finished by a Pi gentle-ai-worker after the
+  OpenCode run was cancelled by the owner).
+- T6 tools, state file, /recall, CLI, design doc: `9482d0a` (Pi gentle-ai-worker).
+  Scope decision: 10 tools (the 7 planned + mem_judge, mem_pin, mem_unpin).
+- T7 docs: `47a710c` (inline). Throwaway HERMES_HOME install from the local repo:
+  `memory status` shows `Provider: recall ... available`, a real `hermes chat -q`
+  turn showed `🧠 Recall · hermes-recall — recalled 3 memories`, prompt captured,
+  session registered and ended, `state.json` written.
+- Independent verification (gentle-ai-verify): no blockers; 2 majors (private-tag
+  redaction after truncation in compaction/delegation, no session registration
+  retry) and minors. Fix pass (Pi gentle-ai-worker, test-first): redaction before
+  truncation, session registration retry, queue_prefetch reduced to project
+  warm-up, no recapture after a session switch, state.json only from the primary
+  context, loopback without proxies, MCP Engram results not captured, real
+  Hermes loader test. 593 tests passed, ruff clean.
 
 ## Next step
 
-T1-T6 delegated to one OpenCode writer.
+Fix the verifier findings, then public repo, tag v0.1.0, GitHub install check,
+and T8 in hermes-odd (other session).

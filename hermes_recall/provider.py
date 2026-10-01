@@ -114,6 +114,10 @@ _ARCHIVE_UNKNOWN = "unknown"
 # Derived from the authoritative schema list in ``tools.py``, never a second copy.
 _MEMORY_TOOL_NAMES = tools_module.TOOL_NAMES
 
+# The same loop through Engram's own MCP server, when the user also has it wired in:
+# Hermes names MCP tools ``mcp__<server>__<tool>`` or ``mcp_<server>_<tool>``.
+_MCP_ENGRAM_TOOL_PREFIXES = ("mcp__engram__", "mcp_engram_")
+
 # Hermes core already gave its own background executor a 5s FIFO drain before it
 # calls provider ``shutdown()``, and the user is waiting on process exit by then.
 # Our queue holds at most a handful of small HTTP writes, each already bounded by
@@ -167,7 +171,7 @@ Accomplished, Next Steps and Relevant Files."""
 
 @dataclass(frozen=True)
 class _Recall:
-    """One rendered recall result, cached by :meth:`RecallProvider.queue_prefetch`."""
+    """One rendered recall result, built by :meth:`RecallProvider._build_recall`."""
 
     query_key: str
     project: str
@@ -213,8 +217,12 @@ class RecallProvider(MemoryProvider):
         # only ever describe the last one.
         self._last_recall_count: int = 0
         self._last_recall_injected: bool = False
-        self._prefetch_cache: _Recall | None = None
         self._context_fetched: bool = False
+
+        # The session id Engram last confirmed a ``POST /sessions`` for. Compared
+        # with ``_session_id`` rather than kept as a bool, so a switch can never
+        # leave the previous session's "registered" verdict standing for the new one.
+        self._registered_session_id: str = ""
 
         # Capture state, per session.
         self._turn_number: int = 0
@@ -229,6 +237,11 @@ class RecallProvider(MemoryProvider):
         # conversation every turn, so without this every turn would re-capture every
         # earlier turn's tool results.
         self._synced_message_count: int = 0
+        # Set whenever the transcript we will be handed next may already hold
+        # messages that belong to an earlier session (startup on a resumed session,
+        # /resume, compression). The first sync_turn then skips everything before the
+        # turn that just ran instead of re-posting the inherited history.
+        self._capture_mark_pending: bool = True
 
         # Background worker, started lazily on first use.
         self._queue: queue.Queue[tuple[str, Callable[[], None] | None]] = queue.Queue(
@@ -339,7 +352,9 @@ class RecallProvider(MemoryProvider):
                 project,
             )
             return
-        self._client.create_session(self._session_id, project, directory=_working_directory())
+        # A failure here is not final: every later write retries the registration
+        # (see _registered_write), so an Engram that comes up mid-session recovers.
+        self._register_session_now(project)
 
     def shutdown(self) -> None:
         """Stop the worker: enqueue the sentinel and join briefly. Never raises.
@@ -459,7 +474,7 @@ class RecallProvider(MemoryProvider):
         return project
 
     def _reset_project_cache(self) -> None:
-        """Forget the detected project and any cached recall.
+        """Forget the detected project and the once-per-session context flag.
 
         The narrow reset: everything derived from *which project we are in*. Use
         :meth:`_reset_session_state` for a session switch, which also clears the
@@ -467,7 +482,6 @@ class RecallProvider(MemoryProvider):
         """
         self._project = ""
         self._project_detected = False
-        self._invalidate_prefetch_cache()
         self._context_fetched = False
 
     def _reset_session_state(self) -> None:
@@ -486,15 +500,18 @@ class RecallProvider(MemoryProvider):
         A switch — ``/reset``, ``/new``, ``/resume``, ``/branch``, compression — can
         land in a different working directory, so the project is re-detected either
         way. A rewind keeps the same session and directory; only the per-turn caches
-        are stale. ``_synced_message_count`` goes back to zero here because the new
-        session starts a new transcript, and leaving it high would make the new
-        session's early tool results look "already seen".
+        are stale. ``_synced_message_count`` goes back to zero and the capture mark
+        becomes *pending*: the next transcript may be brand new (``/new``) or may
+        carry the old session's history (``/resume``, compression), and only the
+        next :meth:`sync_turn` can tell which — see :func:`_current_turn_start`.
         """
         self._reset_project_cache()
         self._reset_turn_caches()
         self._turn_number = 0
         self._synced_message_count = 0
+        self._capture_mark_pending = True
         self._last_pre_compress_hash = ""
+        self._registered_session_id = ""
 
     def _reset_turn_caches(self) -> None:
         """Drop state that describes one turn, keeping session and project state.
@@ -505,13 +522,8 @@ class RecallProvider(MemoryProvider):
         instead clamped down to the list's real length by :meth:`_collect_captures`
         the next time a shorter list shows up.
         """
-        self._invalidate_prefetch_cache()
         self._last_recall_count = 0
         self._last_recall_injected = False
-
-    def _invalidate_prefetch_cache(self) -> None:
-        """Drop the queued-prefetch cache. Exposed for T5's session-switch hook."""
-        self._prefetch_cache = None
 
     # -- System prompt -------------------------------------------------------
 
@@ -568,16 +580,7 @@ class RecallProvider(MemoryProvider):
             if not query_key:
                 return ""
 
-            cached = self._prefetch_cache
-            if cached is not None and cached.query_key == query_key and cached.project == project:
-                # Serving a cached answer costs no network time, so the budget never
-                # blocks it: the deadline exists to bound requests, and there are
-                # none on this path. Only the synchronous fetch below is gated, by
-                # _build_recall, which abandons the search when the budget — already
-                # possibly spent on project detection above — has run out.
-                recall = cached
-            else:
-                recall = self._build_recall(query_key, project, deadline=deadline)
+            recall = self._build_recall(query_key, project, deadline=deadline)
 
             if recall.text:
                 self._last_recall_count = recall.count
@@ -597,42 +600,35 @@ class RecallProvider(MemoryProvider):
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Precompute the next turn's recall in the background. Never raises.
+        """Warm the cheap per-session state for the next turn. Never raises.
 
-        Hermes calls ``queue_prefetch_all`` on its own shared background worker, so
-        this must return immediately and do the fetching on ours.
+        Deliberately **no search**. ``MemoryManager`` calls ``queue_prefetch_all``
+        after a turn completes, with that *finished* turn's message, while the next
+        :meth:`prefetch` is asked about the *next* user message. A recall computed
+        for the old text would almost never match, so it would cost one ``/search``
+        on our single worker per turn for nothing — and, worse, it could spend the
+        once-per-session ``/context`` inside a result nobody is ever served.
 
-        The cache is single-entry and keyed on ``(normalised query, project)``, so a
-        cached answer is only ever served for the exact query it was computed for —
-        a stale recall is worse than none. It is invalidated on a session switch and
-        whenever the project changes (:meth:`_reset_project_cache`).
+        What does carry over is the project: detection is a request, and once it
+        succeeds it holds for the whole session. Warming it here moves that request
+        off the next turn's synchronous budget. Nothing else is touched, so the
+        first non-trivial prefetch still fetches and injects the project context.
         """
         try:
             if not self._config.enabled:
                 return
             if is_trivial_prompt(query):
                 return
-            query_key = _normalize_query(query)
-            if not query_key:
+            if self._project_detected:
                 return
             resolved_session = self._resolve_session_id(session_id)
 
             def job() -> None:
                 project = self._ensure_project()
-                if not project:
-                    return
-                # deadline=None: this runs on our worker, off the turn's critical
-                # path, so it may take its time — and taking its time is the point,
-                # since a background fetch that completes is what spares the next
-                # turn a synchronous one. If it overruns, the next prefetch simply
-                # finds no cache and fetches under its own budget.
-                recall = self._build_recall(query_key, project, deadline=None)
-                self._prefetch_cache = recall
                 logger.debug(
-                    "recall queue_prefetch: cached project=%s session=%s hits=%d",
+                    "recall queue_prefetch: warmed project=%r session=%s",
                     project,
                     resolved_session,
-                    recall.count,
                 )
 
             self._submit("queue-prefetch", job)
@@ -649,8 +645,8 @@ class RecallProvider(MemoryProvider):
         turn's actual recall value, the project context is a one-off nice-to-have,
         so when time runs out the thing that gets dropped must be the optional one.
 
-        ``deadline`` is a :func:`time.monotonic` instant, or ``None`` for "no limit"
-        (the background path). When it has passed, the search is abandoned and an
+        ``deadline`` is a :func:`time.monotonic` instant, or ``None`` for "no limit".
+        When it has passed, the search is abandoned and an
         empty recall is returned; ``/context`` is held to a stricter rule — it only
         starts when the budget can still absorb a full read timeout.
         """
@@ -737,7 +733,12 @@ class RecallProvider(MemoryProvider):
                 if not project:
                     logger.debug("recall: no project; dropping prompt capture")
                     return
-                self._client.add_prompt(session_id, content, project=project)
+                register = self._registration_for(session_id, project)
+                self._registered_write(
+                    session_id,
+                    register,
+                    lambda: self._client.add_prompt(session_id, content, project=project),
+                )
 
             self._submit("prompt-capture", job)
         except Exception:
@@ -803,12 +804,18 @@ class RecallProvider(MemoryProvider):
                 if not project:
                     logger.debug("recall: no project; dropping %d captures", len(captures))
                     return
+                # One registration attempt for the whole batch, never one per capture.
+                register = self._registration_for(session_id_for_turn, project)
                 for source, content in captures:
                     # Guarded individually: one rejected capture must not abandon the
                     # rest of the turn's.
                     try:
-                        self._client.passive_capture(
-                            session_id_for_turn, content, project=project, source=source
+                        self._registered_write(
+                            session_id_for_turn,
+                            register,
+                            lambda c=content, s=source: self._client.passive_capture(
+                                session_id_for_turn, c, project=project, source=s
+                            ),
                         )
                     except Exception:
                         logger.debug("recall: capture from %s failed", source, exc_info=True)
@@ -835,7 +842,12 @@ class RecallProvider(MemoryProvider):
         if isinstance(messages, list):
             snapshot = list(messages)
             start = self._synced_message_count
-            if start > len(snapshot):
+            if self._capture_mark_pending:
+                # First transcript since startup or a session switch: skip whatever
+                # was inherited from before this turn (see _current_turn_start).
+                self._capture_mark_pending = False
+                start = _current_turn_start(snapshot)
+            elif start > len(snapshot):
                 # The transcript shrank, so it was compacted or rewound under us.
                 # Treat everything currently present as seen: re-posting a whole
                 # history would be worse than missing one turn, and T5 owns the
@@ -881,11 +893,8 @@ class RecallProvider(MemoryProvider):
             if not self._write_gate_open():
                 return
 
-            composed = _compose_delegation(task, result)
-            if len(composed) <= PASSIVE_MIN_CHARS:
-                return
-            content = strip_private(composed)
-            if not content:
+            content = _compose_delegation(task, result)
+            if len(content) <= PASSIVE_MIN_CHARS:
                 return
 
             session_id = self._session_id
@@ -896,8 +905,13 @@ class RecallProvider(MemoryProvider):
                 if not project:
                     logger.debug("recall: no project; dropping delegation capture")
                     return
-                self._client.passive_capture(
-                    session_id, content, project=project, source="subagent"
+                register = self._registration_for(session_id, project)
+                self._registered_write(
+                    session_id,
+                    register,
+                    lambda: self._client.passive_capture(
+                        session_id, content, project=project, source="subagent"
+                    ),
                 )
 
             self._submit("delegation-capture", job)
@@ -1109,15 +1123,29 @@ class RecallProvider(MemoryProvider):
             logger.debug("recall: no budget to archive the compaction digest")
             return _ARCHIVE_UNKNOWN
 
-        saved = self._client.add_observation(
-            session_id,
-            "Compaction recovery summary",
-            content,
-            type_="session_summary",
-            project=project,
-            scope="project",
-            topic_key="session/compaction-recovery",
-        )
+        def post() -> dict[str, Any] | None:
+            return self._client.add_observation(
+                session_id,
+                "Compaction recovery summary",
+                content,
+                type_="session_summary",
+                project=project,
+                scope="project",
+                topic_key="session/compaction-recovery",
+            )
+
+        register_once = self._registration_for(session_id, project)
+
+        def register() -> bool:
+            # This runs on the caller thread under the compaction budget, so a
+            # registration is only worth starting when it AND the write it unblocks
+            # still fit. Otherwise the archive is reported as not written.
+            if not _room_for_call(deadline, 2 * client_module.WRITE_TIMEOUT_S):
+                logger.debug("recall: no budget to register the session at compaction")
+                return False
+            return register_once()
+
+        saved = self._registered_write(session_id, register, post)
         if isinstance(saved, dict):
             self._last_pre_compress_hash = digest
             return _ARCHIVE_CONFIRMED
@@ -1174,17 +1202,63 @@ class RecallProvider(MemoryProvider):
             logger.debug("recall handle_tool_call failed (non-fatal)", exc_info=True)
             return tools_module.error_result(f"{tool_name} failed: {type(exc).__name__}")
 
-    def _register_session_now(self, project: str) -> bool:
-        """Register the current session synchronously (tool thread). Idempotent server-side."""
-        if not self._writes_enabled or not self._session_id:
+    def _register_session_now(self, project: str, session_id: str = "") -> bool:
+        """Register a session synchronously on the calling thread. Idempotent server-side.
+
+        ``session_id`` defaults to the current session. A success for the current
+        session is remembered (:attr:`_registered_session_id`) so later writes skip
+        the pre-registration; a success for any other id is not, because a switch
+        may have happened since the job that asked was queued.
+        """
+        target_session = session_id or self._session_id
+        if not self._writes_enabled or not target_session:
             return False
         target = project or self._ensure_project()
         if not target:
             return False
         created = self._client.create_session(
-            self._session_id, target, directory=_working_directory()
+            target_session, target, directory=_working_directory()
         )
-        return created is not None
+        if created is None:
+            return False
+        if target_session == self._session_id:
+            self._registered_session_id = target_session
+        return True
+
+    def _registration_for(self, session_id: str, project: str) -> Callable[[], bool]:
+        """Return a register callable for one write job that posts ``/sessions`` at most once.
+
+        Shared between the job's pre-registration and its ``session not found``
+        retry, and across every capture in a batch, so a job can never turn one
+        unreachable or refusing Engram into a registration storm.
+        """
+        outcome: list[bool] = []
+
+        def register() -> bool:
+            if not outcome:
+                outcome.append(self._register_session_now(project, session_id=session_id))
+            return outcome[0]
+
+        return register
+
+    def _registered_write(
+        self, session_id: str, register: Callable[[], bool], write: Callable[[], Any]
+    ) -> Any:
+        """Run one Engram write for ``session_id``, registering the session as needed.
+
+        Two recoveries, both bounded by ``register``'s once-per-job guarantee:
+
+        * **Before** the write, when Engram has not confirmed this session yet. The
+          registration from :meth:`initialize` (or a switch) fails whenever Engram is
+          down or the project cannot be resolved at that moment, and without this
+          every write for the rest of the session would 404.
+        * **After** a ``session not found`` answer, register and retry once — the
+          same recovery ``mem_save`` uses, through the same helper
+          (:func:`tools.with_session_retry`).
+        """
+        if not (session_id and session_id == self._registered_session_id):
+            register()
+        return tools_module.with_session_retry(self._client, write, register)
 
     # -- Slash command -------------------------------------------------------
 
@@ -1302,10 +1376,37 @@ def _extract_tool_captures(messages: list[Any], start: int) -> list[tuple[str, s
         if not isinstance(content, str) or not content:
             continue
         source = _tool_source(message, tool_call_names)
-        if source.lower() in _MEMORY_TOOL_NAMES:
+        if _is_memory_tool(source):
             continue
         captures.append((source, content))
     return captures
+
+
+def _is_memory_tool(name: str) -> bool:
+    """Whether ``name`` is a memory tool whose result must never be captured.
+
+    Our own ``mem_*`` tools, plus Engram's MCP tools under either Hermes naming
+    scheme: recalled memory written back as a new observation is the same feedback
+    loop whichever surface fetched it.
+    """
+    lowered = name.lower()
+    return lowered in _MEMORY_TOOL_NAMES or lowered.startswith(_MCP_ENGRAM_TOOL_PREFIXES)
+
+
+def _current_turn_start(messages: list[Any]) -> int:
+    """Index of the last user message, i.e. where the turn that just ran begins.
+
+    Used once after a session boundary, when the transcript may carry history the
+    previous session already captured. Everything before the last user message
+    belongs to earlier turns; a genuinely new transcript has its only user message
+    at the front, so nothing of it is skipped. A transcript with no user message at
+    all cannot be inherited history, so it is treated as new.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            return index
+    return 0
 
 
 def _tool_call_names(messages: list[Any]) -> dict[str, str]:
@@ -1349,9 +1450,14 @@ def _tool_source(message: dict[str, Any], tool_call_names: dict[str, str]) -> st
 
 
 def _compose_delegation(task: str, result: str) -> str:
-    """Render a delegation as one observation body, each half capped independently."""
-    task_text = truncate(task if isinstance(task, str) else "", DELEGATION_TASK_MAX_CHARS)
-    result_text = truncate(result if isinstance(result, str) else "", DELEGATION_RESULT_MAX_CHARS)
+    """Render a delegation as one observation body, each half redacted, then capped.
+
+    Redaction runs on the **full** raw half, before its cap, for the reason spelled
+    out in :meth:`RecallProvider._prompt_content`: a ``<private>`` block straddling
+    the cut would otherwise lose its closing tag, match nothing, and leak its head.
+    """
+    task_text = truncate(strip_private(task), DELEGATION_TASK_MAX_CHARS)
+    result_text = truncate(strip_private(result), DELEGATION_RESULT_MAX_CHARS)
     return f"**Delegated task**: {task_text}\n\n**Subagent result**: {result_text}"
 
 
@@ -1362,6 +1468,9 @@ def _compose_compaction_digest(messages: list[dict[str, Any]] | None) -> str:
     re-posting it whole would just move the problem into the user's memory store. What
     survives is the shape of the conversation — how long it ran, what the user asked,
     and where the assistant left off — which is what someone resuming needs.
+
+    Every row is redacted on its full raw text, before the per-turn and last-reply
+    cuts, so no cut can split a ``<private>`` block and leak its head.
     """
     rows = [m for m in (messages or []) if isinstance(m, dict)]
 
@@ -1395,10 +1504,10 @@ def _compose_compaction_digest(messages: list[dict[str, Any]] | None) -> str:
 
 
 def _collapse(content: Any) -> str:
-    """Collapse a message's text content to one whitespace-normalised line, else ``""``."""
+    """Redact, then collapse a message's text to one whitespace-normalised line, else ``""``."""
     if not isinstance(content, str):
         return ""
-    return " ".join(content.split())
+    return " ".join(strip_private(content).split())
 
 
 def _build_recovery_notice(project: str, context: str, outcome: str) -> str:

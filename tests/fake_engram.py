@@ -63,13 +63,16 @@ class FakeEngram:
         self,
         routes: dict[tuple[str, str], Route] | None = None,
         default_response: Response = (404, {"error": "not found"}),
+        port: int = 0,
     ) -> None:
         self.routes: dict[tuple[str, str], Route] = dict(routes or {})
         self.default_response: Response = default_response
         self.requests: list[RecordedRequest] = []
         self._lock = threading.Lock()
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self))
+        # ``port`` is 0 (the OS picks) except for tests that need a server to come
+        # up on a port a client was already pointed at while nothing listened there.
+        server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(self))
         server.daemon_threads = True
         self._server = server
         # A short poll interval matters: BaseServer.shutdown() blocks until the

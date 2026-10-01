@@ -308,22 +308,6 @@ def test_switch_makes_the_next_prefetch_fetch_the_context_again(
     assert count_requests(fake_engram, "GET", "/context") == 2
 
 
-def test_switch_does_not_serve_the_previous_sessions_cached_recall(
-    fake_engram: FakeEngram, provider_factory: Any
-) -> None:
-    wire_engram(fake_engram)
-    provider = provider_factory(fake_engram.base_url)
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-    searches_before = count_requests(fake_engram, "GET", "/search")
-
-    provider.on_session_switch(NEXT_SESSION, reset=True)
-    assert provider._drain_for_test()
-    provider.prefetch("why does the loader skip my provider")
-
-    assert count_requests(fake_engram, "GET", "/search") == searches_before + 1
-
-
 def test_switch_resets_the_capture_high_water_mark(
     fake_engram: FakeEngram, provider_factory: Any
 ) -> None:
@@ -382,15 +366,14 @@ def test_a_rewind_drops_turn_caches_without_ending_or_registering(
 ) -> None:
     wire_engram(fake_engram)
     provider = provider_factory(fake_engram.base_url)
-    provider.queue_prefetch("why does the loader skip my provider")
-    assert provider._drain_for_test()
-    assert provider._prefetch_cache is not None
+    provider.prefetch("why does the loader skip my provider")
+    assert provider.recall_status() is not None
     fake_engram.reset()
 
     provider.on_session_switch(SESSION, reset=False, rewound=True)
     assert provider._drain_for_test()
 
-    assert provider._prefetch_cache is None
+    assert provider.recall_status() is None
     assert end_requests(fake_engram) == []
     assert fake_engram.find("POST", "/sessions") is None
     assert provider._session_id == SESSION
@@ -901,9 +884,137 @@ def test_reset_session_state_clears_every_per_session_field(
     assert provider._project == ""
     assert provider._project_detected is False
     assert provider._context_fetched is False
-    assert provider._prefetch_cache is None
+    assert provider._registered_session_id == ""
+    assert provider._capture_mark_pending is True
     assert provider._last_recall_count == 0
     assert provider._last_recall_injected is False
     assert provider._turn_number == 0
     assert provider._synced_message_count == 0
     assert provider._last_pre_compress_hash == ""
+
+
+# -- 9. redaction runs before the digest's per-row cuts --------------------------
+
+SECRET = "SECRETZ"
+
+
+def private_straddling(cut: int) -> str:
+    """Text whose ``<private>`` block opens just before ``cut`` and closes well after it."""
+    return "a" * (cut - 20) + "<private>" + SECRET * 100 + "</private>" + " tail"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            {"role": "user", "content": private_straddling(provider_module._DIGEST_USER_CHARS)},
+            {"role": "assistant", "content": "answer with some detail"},
+        ],
+        [
+            {"role": "user", "content": "question about the loader"},
+            {
+                "role": "assistant",
+                "content": private_straddling(provider_module._DIGEST_ASSISTANT_CHARS),
+            },
+        ],
+    ],
+    ids=["user-turn-cut", "last-reply-cut"],
+)
+def test_on_pre_compress_does_not_leak_a_block_straddling_a_digest_cut(
+    fake_engram: FakeEngram, provider_factory: Any, rows: list[dict[str, Any]]
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    provider.on_pre_compress(rows)
+
+    content = observation_requests(fake_engram)[0].json_body["content"]
+    assert "SECRET" not in content, "the straddling private block leaked"
+    assert REDACTED in content
+
+
+# -- 10. the compaction archive registers an unregistered session ---------------
+
+
+def test_on_pre_compress_registers_and_retries_on_session_not_found(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    attempts: list[int] = []
+
+    def observations(_request: RecordedRequest) -> tuple[int, Any]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return (404, {"error": "session not found"})
+        return (201, {"id": 900, "status": "saved"})
+
+    fake_engram.route("POST", "/observations", observations)
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    notice = provider.on_pre_compress(transcript())
+
+    assert len(attempts) == 2
+    assert count_requests(fake_engram, "POST", "/sessions") == 1
+    assert "already saved" in notice
+
+
+# -- 11. the capture mark after a switch skips the inherited transcript ----------
+
+
+def test_the_first_sync_after_a_switch_does_not_recapture_the_inherited_transcript(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    # Compression or /resume hands the new session a transcript that already holds
+    # tool results captured under the old one. Only the turn that just ran is new.
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "first question about the loader"},
+        tool_message("o" * 80),
+        tool_message("p" * 80),
+        {"role": "assistant", "content": "first answer"},
+    ]
+    provider.sync_turn("ask", "", session_id=SESSION, messages=history)
+    assert provider._drain_for_test()
+
+    provider.on_session_switch(NEXT_SESSION, reset=False)
+    assert provider._drain_for_test()
+    fake_engram.reset()
+
+    resumed = [
+        *history,
+        {"role": "user", "content": "second question about the loader"},
+        tool_message("n" * 80),
+    ]
+    provider.sync_turn("ask", "", session_id=NEXT_SESSION, messages=resumed)
+    assert provider._drain_for_test()
+
+    contents = [r.json_body["content"] for r in fake_engram.requests if r.path.endswith("passive")]
+    assert contents == ["n" * 80]
+    assert provider._synced_message_count == len(resumed)
+
+
+def test_the_first_sync_after_a_switch_captures_a_genuinely_new_transcript(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+    provider.sync_turn("ask", "", session_id=SESSION, messages=[tool_message("o" * 80)] * 3)
+    assert provider._drain_for_test()
+
+    provider.on_session_switch(NEXT_SESSION, reset=True)
+    assert provider._drain_for_test()
+    fake_engram.reset()
+
+    fresh = [
+        {"role": "user", "content": "a brand new question"},
+        tool_message("n" * 80),
+        tool_message("m" * 80),
+    ]
+    provider.sync_turn("ask", "", session_id=NEXT_SESSION, messages=fresh)
+    assert provider._drain_for_test()
+
+    contents = [r.json_body["content"] for r in fake_engram.requests if r.path.endswith("passive")]
+    assert contents == ["n" * 80, "m" * 80]

@@ -63,6 +63,9 @@ JUDGE_RELATIONS = (
 # through, and these ones also earn an explicit next-step hint.
 JUDGMENT_KEYS = ("judgment_required", "judgment_id", "candidates", "conflicts")
 
+# Engram's error text for a write naming a session it has no row for.
+SESSION_NOT_FOUND = "session not found"
+
 # -- Schemas ------------------------------------------------------------------
 
 
@@ -299,8 +302,15 @@ def _project(env: ToolEnv, args: dict[str, Any]) -> str:
 
 
 def _remember(env: ToolEnv, observation_id: Any, action: str, project: str) -> None:
-    """Persist the last memory id. A failure is swallowed: state is a convenience."""
+    """Persist the last memory id. A failure is swallowed: state is a convenience.
+
+    Primary context only. ``state.json`` describes what the user's own agent did;
+    a subagent or cron run reading an observation must not move ``last_memory_id``
+    under the plugins that read it.
+    """
     try:
+        if not env.writes_enabled:
+            return
         if isinstance(observation_id, bool) or not isinstance(observation_id, int):
             return
         write_state(
@@ -390,15 +400,29 @@ def _save(
             topic_key=topic_key,
         )
 
-    saved = post()
-    if saved is None and "session not found" in env.client.last_error_text():
-        # The background registration from initialize() has not landed (or failed).
-        # Registration is idempotent, so register synchronously and retry once.
-        if env.register_session(project):
-            saved = post()
+    saved = with_session_retry(env.client, post, lambda: env.register_session(project))
     if saved is None:
         raise _engram_error(env, "save")
     return saved
+
+
+def with_session_retry(
+    client: EngramClient, write: Callable[[], Any], register: Callable[[], bool]
+) -> Any:
+    """Run ``write``; on Engram's ``session not found``, ``register`` once and retry once.
+
+    Shared by the tools and every background write in the provider. Engram answers
+    404 ``session not found`` whenever a write names a project and the session row
+    does not exist yet (``validateSessionProject``, server.go) — which is what
+    happens when the registration from ``initialize`` never landed. Registration is
+    idempotent server-side, so the recovery is a single register-then-retry. One
+    retry, never a loop: a second 404 means something else is wrong.
+    """
+    result = write()
+    if result is None and SESSION_NOT_FOUND in client.last_error_text():
+        if register():
+            result = write()
+    return result
 
 
 def _save_result(saved: dict[str, Any], project: str) -> dict[str, Any]:
