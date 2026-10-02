@@ -161,6 +161,13 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   approved (review-e6dd28a6e37b6772, 4 non-blocking advisories: second idempotent /end
   on 2.0.0 after resume, autosync overrides a user `ENGRAM_CLOUD_AUTOSYNC=0` like
   upstream, effective-id map bound, tools.py:525). 723 tests.
+- v0.3.0 released: `48c56e8` + `2fe5a10`, tag v0.3.0, CI and release green
+  (4 assets). Live install: `hermes plugins update recall` on the default profile
+  -> 0.3.0 at `2fe5a10`; `memory status` shows recall active, `recall status`
+  shows 7437 reachable and adopted (Engram 2.0.0). `plugins doctor` warns that the
+  manifest's mem_* tools are not added by register(); the manifest only changed
+  its version since v0.2.0, and the tools come from the memory provider. Waiting
+  for the owner's /restart; then Engram can move to v3 (brew stable is 2.2.0).
 
 ## Next step
 
