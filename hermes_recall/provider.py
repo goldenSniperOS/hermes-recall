@@ -99,6 +99,13 @@ PRE_COMPRESS_BUDGET_S = 7.0
 # indefinitely, and an unbounded set would be a slow leak.
 _ENDED_SESSION_MEMORY = 64
 
+# How many runtime -> effective session id mappings to keep. Engram v3 (6af3a4b)
+# answers ``POST /sessions`` with ``"resume": true`` by selecting the session to
+# write into — ``<id>:resume:<N>`` once ``<id>`` has ended — and a queued job may
+# still need an earlier session's mapping after a switch. Bounded for the same
+# reason as the ended set.
+_EFFECTIVE_SESSION_MEMORY = 64
+
 # Outcome of the compaction archive, which decides what the recovery text tells the
 # model to do. Mirrors gentle-engram's ``ArchiveOutcome`` (compaction-recovery.js),
 # minus its ``unavailable`` state, which covers a Pi-specific "could not identify the
@@ -224,6 +231,12 @@ class RecallProvider(MemoryProvider):
         # with ``_session_id`` rather than kept as a bool, so a switch can never
         # leave the previous session's "registered" verdict standing for the new one.
         self._registered_session_id: str = ""
+        # Runtime (Hermes) session id -> the Engram session id its last validated
+        # registration acknowledged. Keyed by runtime id, so a job resolving the id it
+        # snapshotted can only ever land in that session's own record, and kept across
+        # switches for exactly those queued jobs. Dropped when the session is ended,
+        # so the next registration asks the server again. Bounded, insertion-ordered.
+        self._effective_sessions: dict[str, str] = {}
 
         # Capture state, per session.
         self._turn_number: int = 0
@@ -819,7 +832,9 @@ class RecallProvider(MemoryProvider):
                 self._registered_write(
                     session_id,
                     register,
-                    lambda: self._client.add_prompt(session_id, content, project=project),
+                    lambda: self._client.add_prompt(
+                        self._effective_session_id(session_id), content, project=project
+                    ),
                 )
 
             self._submit("prompt-capture", job)
@@ -896,7 +911,10 @@ class RecallProvider(MemoryProvider):
                             session_id_for_turn,
                             register,
                             lambda c=content, s=source: self._client.passive_capture(
-                                session_id_for_turn, c, project=project, source=s
+                                self._effective_session_id(session_id_for_turn),
+                                c,
+                                project=project,
+                                source=s,
                             ),
                         )
                     except Exception:
@@ -992,7 +1010,10 @@ class RecallProvider(MemoryProvider):
                     session_id,
                     register,
                     lambda: self._client.passive_capture(
-                        session_id, content, project=project, source="subagent"
+                        self._effective_session_id(session_id),
+                        content,
+                        project=project,
+                        source="subagent",
                     ),
                 )
 
@@ -1049,7 +1070,7 @@ class RecallProvider(MemoryProvider):
             self._remember_ended_session(session_id)
 
             def job() -> None:
-                self._client.end_session(session_id, summary="")
+                self._client.end_session(self._close_effective_session(session_id), summary="")
 
             self._submit("session-end", job)
         except Exception:
@@ -1088,6 +1109,10 @@ class RecallProvider(MemoryProvider):
 
             self._session_id = new_session_id or ""
             self._reset_session_state()
+            # Entering a session (again) reopens it: with ``resume`` its registration
+            # yields a live continuation, which the next /reset must end even though
+            # this runtime id was ended before.
+            self._ended_sessions.pop(self._session_id, None)
 
             if self._session_id:
                 logger.debug(
@@ -1125,7 +1150,7 @@ class RecallProvider(MemoryProvider):
         self._remember_ended_session(previous_session_id)
 
         def job() -> None:
-            self._client.end_session(previous_session_id, summary="")
+            self._client.end_session(self._close_effective_session(previous_session_id), summary="")
 
         self._submit("session-end", job)
 
@@ -1136,6 +1161,29 @@ class RecallProvider(MemoryProvider):
         self._ended_sessions[session_id] = None
         while len(self._ended_sessions) > _ENDED_SESSION_MEMORY:
             self._ended_sessions.pop(next(iter(self._ended_sessions)))
+
+    def _effective_session_id(self, runtime_id: str) -> str:
+        """The Engram session id writes for ``runtime_id`` go to.
+
+        The id the last validated registration acknowledged, else ``runtime_id``
+        itself — what an unregistered write has always targeted, and what Engram
+        2.0.0 acknowledges anyway. Write closures call this when they run, not when
+        they are queued, so a registration earlier in the same job (or the ``session
+        not found`` retry) is picked up.
+        """
+        return self._effective_sessions.get(runtime_id, runtime_id)
+
+    def _close_effective_session(self, runtime_id: str) -> str:
+        """Forget ``runtime_id``'s registration and return the id to post ``/end`` for.
+
+        Runs inside the end job, so every write queued before it has already used
+        the mapping. Afterwards a write for the same runtime id registers again, and
+        with ``resume`` Engram v3 hands it a continuation instead of the ended root.
+        """
+        effective = self._effective_sessions.pop(runtime_id, runtime_id)
+        if self._registered_session_id == runtime_id:
+            self._registered_session_id = ""
+        return effective
 
     # -- Compaction ----------------------------------------------------------
 
@@ -1210,7 +1258,7 @@ class RecallProvider(MemoryProvider):
 
         def post() -> dict[str, Any] | None:
             return self._client.add_observation(
-                session_id,
+                self._effective_session_id(session_id),
                 "Compaction recovery summary",
                 content,
                 type_="session_summary",
@@ -1247,7 +1295,10 @@ class RecallProvider(MemoryProvider):
         if not _room_for_call(deadline):
             logger.debug("recall: no budget for the compaction context")
             return ""
-        return truncate(self._client.compaction_context(session_id), RECOVERY_MAX_CHARS)
+        return truncate(
+            self._client.compaction_context(self._effective_session_id(session_id)),
+            RECOVERY_MAX_CHARS,
+        )
 
     # -- Tools ---------------------------------------------------------------
 
@@ -1278,14 +1329,18 @@ class RecallProvider(MemoryProvider):
                 return tools_module.error_result(
                     f"Engram server not used (foreign instance): {foreign}"
                 )
+            runtime_id = self._session_id
             env = tools_module.ToolEnv(
                 client=self._client,
-                session_id=self._session_id,
+                session_id=runtime_id,
                 hermes_home=resolve_hermes_home(self._hermes_home),
                 writes_enabled=self._writes_enabled,
                 agent_context=self._agent_context,
                 resolve_project=self._ensure_project,
-                register_session=self._register_session_now,
+                register_session=lambda project: self._register_session_now(
+                    project, session_id=runtime_id
+                ),
+                effective_session_id=lambda: self._effective_session_id(runtime_id),
             )
             return tools_module.handle_tool_call(env, tool_name, args)
         except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
@@ -1299,6 +1354,11 @@ class RecallProvider(MemoryProvider):
         session is remembered (:attr:`_registered_session_id`) so later writes skip
         the pre-registration; a success for any other id is not, because a switch
         may have happened since the job that asked was queued.
+
+        Success means a *validated* acknowledgement (:func:`_acknowledged_session`):
+        its id becomes the session's effective id for every later write, whichever
+        session is current. Anything else is a failed registration, and its id is
+        never written to.
         """
         target_session = session_id or self._session_id
         if not self._writes_enabled or not target_session or self._foreign_reason():
@@ -1311,6 +1371,16 @@ class RecallProvider(MemoryProvider):
         )
         if created is None:
             return False
+        effective = _acknowledged_session(target_session, created)
+        if not effective:
+            logger.debug("recall: unusable registration ack for session %s", target_session)
+            return False
+        if effective != target_session:
+            logger.debug("recall: session %s resumes as %s", target_session, effective)
+        self._effective_sessions.pop(target_session, None)
+        self._effective_sessions[target_session] = effective
+        while len(self._effective_sessions) > _EFFECTIVE_SESSION_MEMORY:
+            self._effective_sessions.pop(next(iter(self._effective_sessions)))
         if target_session == self._session_id:
             self._registered_session_id = target_session
         return True
@@ -1404,6 +1474,29 @@ def _set_active_provider(provider: RecallProvider) -> None:
 def _get_active_provider() -> RecallProvider | None:
     """Return the most recently initialized provider, if it is still alive."""
     return _active_provider() if _active_provider is not None else None
+
+
+def _acknowledged_session(runtime_id: str, ack: dict[str, Any]) -> str:
+    """The effective session id a ``POST /sessions`` ack names, or ``""`` when unusable.
+
+    Validated like gentle-engram 0.2.0 (``registerEffectiveSession``, index.ts): the
+    status must be ``"created"`` and the id either ``runtime_id`` itself or
+    ``<runtime_id>:resume:<N>`` with a purely numeric ``N``. A missing or non-string
+    id is rejected too, exactly as upstream does. Engram 2.0.0 echoes the id, so
+    there the effective id is always ``runtime_id``.
+    """
+    if ack.get("status") != "created":
+        return ""
+    effective = ack.get("id")
+    if not isinstance(effective, str):
+        return ""
+    if effective == runtime_id:
+        return effective
+    prefix = f"{runtime_id}:resume:"
+    ordinal = effective[len(prefix) :] if effective.startswith(prefix) else ""
+    if ordinal.isascii() and ordinal.isdigit():
+        return effective
+    return ""
 
 
 def _normalize_query(query: str) -> str:

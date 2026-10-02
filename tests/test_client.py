@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import socket
+import threading
 import time
 import typing
 from typing import Any
@@ -294,7 +295,9 @@ def test_update_observation_sends_only_the_keys_passed(fake_engram: FakeEngram) 
     updated = {"id": 761, "title": "New title", "content": "body"}
     fake_engram.route("PATCH", "/observations/761", (200, updated))
 
-    result = client_for(fake_engram).update_observation(761, title="New title")
+    result = client_for(fake_engram).update_observation(
+        761, expected_project="proj", title="New title"
+    )
 
     assert result == updated
     request = fake_engram.find("PATCH", "/observations/761")
@@ -302,12 +305,55 @@ def test_update_observation_sends_only_the_keys_passed(fake_engram: FakeEngram) 
     assert request.json_body == {"title": "New title"}
 
 
+def test_update_observation_sends_expected_project_as_a_query_param(
+    fake_engram: FakeEngram,
+) -> None:
+    # Engram v3 (e8c0ce3) 400s a PATCH without `?expected_project=`, and it is a
+    # query param, never a body field: the body `project` key means "move it".
+    fake_engram.route("PATCH", "/observations/761", (200, {"id": 761}))
+
+    client_for(fake_engram).update_observation(
+        761, expected_project="  hermes recall/x ", title="T"
+    )
+
+    request = fake_engram.find("PATCH", "/observations/761")
+    assert request is not None
+    assert request.query == {"expected_project": ["hermes recall/x"]}
+    assert "expected_project" not in request.json_body
+
+
+@pytest.mark.parametrize("expected_project", ["", "   ", None])
+def test_update_observation_without_expected_project_makes_no_request(
+    fake_engram: FakeEngram, expected_project: Any
+) -> None:
+    client = client_for(fake_engram)
+
+    assert client.update_observation(761, expected_project=expected_project, title="T") is None
+    assert client.update_observation(761, title="T") is None
+    assert fake_engram.requests == []
+    assert "expected_project" in client.last_error_text()
+
+
+def test_update_observation_surfaces_an_owner_mismatch(fake_engram: FakeEngram) -> None:
+    fake_engram.route(
+        "PATCH",
+        "/observations/761",
+        (409, {"error": "expected_project does not match observation owner"}),
+    )
+    client = client_for(fake_engram)
+
+    assert client.update_observation(761, expected_project="other", title="T") is None
+    assert client.last_error_text() == (
+        "PATCH /observations/761: HTTP 409 expected_project does not match observation owner"
+    )
+
+
 def test_update_observation_keeps_an_explicit_empty_string(fake_engram: FakeEngram) -> None:
     # The server's patch params are pointers, so "" means "set it to empty" and
     # must reach the wire; only `None` means "leave it alone".
     fake_engram.route("PATCH", "/observations/5", (200, {"id": 5}))
 
-    client_for(fake_engram).update_observation(5, topic_key="", title=None)
+    client_for(fake_engram).update_observation(5, expected_project="p", topic_key="", title=None)
 
     request = fake_engram.find("PATCH", "/observations/5")
     assert request is not None
@@ -317,7 +363,9 @@ def test_update_observation_keeps_an_explicit_empty_string(fake_engram: FakeEngr
 def test_update_observation_ignores_unknown_keys(fake_engram: FakeEngram) -> None:
     fake_engram.route("PATCH", "/observations/5", (200, {"id": 5}))
 
-    client_for(fake_engram).update_observation(5, content="body", nonsense="x", session_id="s")
+    client_for(fake_engram).update_observation(
+        5, expected_project="p", content="body", nonsense="x", session_id="s"
+    )
 
     request = fake_engram.find("PATCH", "/observations/5")
     assert request is not None
@@ -327,7 +375,7 @@ def test_update_observation_ignores_unknown_keys(fake_engram: FakeEngram) -> Non
 def test_update_observation_with_no_fields_makes_no_request(fake_engram: FakeEngram) -> None:
     client = client_for(fake_engram)
 
-    assert client.update_observation(761) is None
+    assert client.update_observation(761, expected_project="p") is None
     assert fake_engram.requests == []
     assert client.last_error_text() != ""
 
@@ -337,7 +385,7 @@ def test_update_observation_with_only_none_fields_makes_no_request(
 ) -> None:
     client = client_for(fake_engram)
 
-    assert client.update_observation(761, title=None, content=None) is None
+    assert client.update_observation(761, expected_project="p", title=None, content=None) is None
     assert fake_engram.requests == []
 
 
@@ -468,8 +516,20 @@ def test_create_session_posts_project_owned_ownership(fake_engram: FakeEngram) -
         "id": "sess-1",
         "project": "hermes-recall",
         "ownership_mode": "project_owned",
+        "resume": True,
     }
     assert "directory" not in request.json_body
+
+
+def test_create_session_returns_the_continuation_ack_unchanged(fake_engram: FakeEngram) -> None:
+    # Engram v3 (6af3a4b): `resume` on an ended root selects `<root>:resume:<N>`.
+    ack = {"id": "sess-1:resume:2", "status": "created", "resumed_from": "sess-1"}
+    fake_engram.route("POST", "/sessions", (201, ack))
+
+    assert client_for(fake_engram).create_session("sess-1", "proj") == ack
+    request = fake_engram.find("POST", "/sessions")
+    assert request is not None
+    assert request.json_body["resume"] is True
 
 
 def test_create_session_includes_a_non_blank_directory(fake_engram: FakeEngram) -> None:
@@ -599,7 +659,7 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
     "create_session": (("sess-1", "proj"), {}),
     "end_session": (("sess-1",), {"summary": "done"}),
     "add_observation": (("sess-1", "Title", "Content"), {}),
-    "update_observation": ((761,), {"title": "New"}),
+    "update_observation": ((761,), {"expected_project": "proj", "title": "New"}),
     "get_observation": ((761,), {}),
     "recent_observations": ((), {}),
     "passive_capture": (("sess-1", "content"), {}),
@@ -809,6 +869,69 @@ def test_last_error_records_status_and_server_message_only(fake_engram: FakeEngr
     assert "session ownership conflict" in error
     # The recorded reason must never leak user content.
     assert secret_content not in error
+
+
+def test_last_error_status_is_the_http_status_of_an_error_answer(
+    fake_engram: FakeEngram,
+) -> None:
+    fake_engram.route("PATCH", "/observations/761", (409, {"error": "owner mismatch"}))
+    fake_engram.route("GET", "/health", (200, HEALTH_PAYLOAD))
+    client = client_for(fake_engram)
+    assert client.last_error_status is None
+
+    assert client.update_observation(761, expected_project="p", title="T") is None
+    assert client.last_error_status == 409
+
+    # A success clears it, like the reason.
+    assert client.health() == HEALTH_PAYLOAD
+    assert client.last_error_status is None
+
+
+def test_last_error_status_is_none_when_no_server_answered(fake_engram: FakeEngram) -> None:
+    fake_engram.route("GET", "/health", (500, {"error": "boom"}))
+    client = client_for(fake_engram)
+    assert client.health() is None
+    assert client.last_error_status == 500
+
+    # A local refusal never asked anyone.
+    assert client.update_observation(761, expected_project="", title="T") is None
+    assert client.last_error_status is None
+
+    assert client.health() is None
+    assert client.last_error_status == 500
+    refused = EngramClient(make_config(f"http://127.0.0.1:{unused_port()}"))
+    assert refused.health() is None
+    assert refused.last_error_text() != ""
+    assert refused.last_error_status is None
+
+
+def test_last_error_status_is_none_after_a_timeout(
+    fake_engram: FakeEngram, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "READ_TIMEOUT_S", 0.1)
+    fake_engram.route("GET", "/health", Delay(0.5))
+    client = client_for(fake_engram)
+
+    assert client.health() is None
+    assert client_module.TIMEOUT_ERROR_MARKER in client.last_error_text()
+    assert client.last_error_status is None
+
+
+def test_last_error_status_is_per_thread(fake_engram: FakeEngram) -> None:
+    fake_engram.route("GET", "/health", (503, {"error": "busy"}))
+    client = client_for(fake_engram)
+    seen: list[int | None] = []
+
+    def probe() -> None:
+        client.health()
+        seen.append(client.last_error_status)
+
+    worker = threading.Thread(target=probe)
+    worker.start()
+    worker.join(5)
+
+    assert seen == [503]
+    assert client.last_error_status is None
 
 
 def test_failures_are_logged_at_debug_only(

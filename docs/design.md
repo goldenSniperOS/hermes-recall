@@ -38,10 +38,10 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `sync_turn` | `POST /observations/passive` | Tool results + assistant text, ≤ 12 per turn; skips `mem_*`, `mcp__engram__*`, `mcp_engram_*` results |
 | `on_delegation` | `POST /observations/passive` (`source=subagent`) | Task / result redacted, then capped at 1000 / 4000 chars |
 | `on_pre_compress` | `POST /observations` (`session_summary`), `GET /context/compaction` | Synchronous, 7 s budget, idempotent by hash |
-| `on_session_switch` / `on_session_end` | `POST /sessions`, `POST /sessions/{id}/end` | `/end` de-duplicated |
+| `on_session_switch` / `on_session_end` | `POST /sessions` (`resume: true`), `POST /sessions/{id}/end` | `/end` de-duplicated; ends the effective session id |
 | `mem_search` | `GET /search` | Default project = detected project |
 | `mem_save` | `POST /observations` | Registers the session and retries once on `session not found` |
-| `mem_update` | `PATCH /observations/{id}` | Only given fields are sent |
+| `mem_update` | `PATCH /observations/{id}?expected_project=` | `expected_project` required, never defaulted; only given fields are sent |
 | `mem_get_observation` | `GET /observations/{id}` | |
 | `mem_context` | `GET /context` | |
 | `mem_session_summary` | `POST /observations` (`type=session_summary`) | |
@@ -147,7 +147,11 @@ when it cannot be opened) and `close_fds=True`.
 
 - **Environment: inherited** from Hermes. `ENGRAM_PORT` and Engram's own data-dir
   settings must reach the child, or it would bind another port or open another
-  store than the one recall (and Pi) talk to.
+  store than the one recall (and Pi) talk to. The child gets a copy plus
+  `ENGRAM_CLOUD_AUTOSYNC=1`, as gentle-engram 0.2.0 spawns it (`2f1e545`); the
+  server skips autosync itself when no cloud server or token is configured. The
+  Hermes process environment is not modified, and adopted or external servers are
+  untouched.
 - **cwd: `<hermes_home>/recall`**, not the Hermes process cwd, so a long-lived
   server never holds a user repository as its working directory.
 - **Log cap:** before each spawn, a log over 1 MB is rotated to
@@ -322,6 +326,54 @@ the project cannot be resolved yet, so registration is not a one-shot:
 - Each job posts `/sessions` at most once, however many captures it carries. At
   compaction, registration only starts when it and the archive write both fit in
   the 7 s budget.
+
+### Effective session id
+
+Registration sends `"resume": true`, as gentle-engram 0.2.0 does (Engram v3,
+`6af3a4b`). When the session already ended (Hermes `/resume` into a session recall
+ended earlier, or a write after `on_session_end`), Engram v3 picks the lowest live
+`<id>:resume:<N>` continuation, or the next ordinal, and acknowledges that id
+(`resumed_from` names the root). The choice is deterministic, so registering again
+returns the same live continuation. Engram 2.0.0 ignores `resume` and echoes the
+id; v2.2 answers 409 `session_already_ended`, which stays a failed registration.
+
+- The ack is validated like upstream: `status` must be `created` and `id` either
+  the Hermes session id or `<id>:resume:<N>` with an ASCII-numeric `N`. Anything
+  else is a failed registration and its id is never written to, including an ack
+  with no `id` or a non-string one (upstream `registerEffectiveSession` rejects
+  those too).
+- A validated id is the session's **effective** id. The provider maps Hermes id →
+  effective id (bounded, 64 entries). Every session-attributed request uses it:
+  prompts, passive and delegation capture, `mem_save`, `mem_session_summary`,
+  `mem_judge`, the compaction archive, `GET /context/compaction` and `/end`.
+  Without a mapping the Hermes id is used, as before.
+- Jobs snapshot the Hermes id when queued and resolve the effective id when they
+  run, right after their own registration (or the `session not found` retry). The
+  map is keyed by Hermes id and survives switches, so a job queued for one session
+  can never write into another session's continuation.
+- The `/end` job ends the effective id, then drops the mapping and the confirmed
+  flag, so the next write for that Hermes id registers again and lands in a
+  continuation. Switching into a session removes it from the recently-ended set,
+  so a later `/reset` ends its continuation too.
+- That removal happens on every switch. On Engram 2.0.0, which has no
+  continuations, end(A) → switch(B) → resume(A) → `/reset` therefore posts a
+  second `/end` for A. This is intentional and harmless: 2.0.0's `EndSession` just
+  re-runs its `UPDATE`, answering 200 and moving `ended_at` to the second end (the
+  summary stays empty, as both ends send one).
+
+## `mem_update` ownership
+
+Engram v3 (`e8c0ce3`) requires `?expected_project=` on `PATCH /observations/{id}`:
+400 when missing or invalid, 409 when it does not match the observation's owner
+or the patch would move it. The server treats it as an explicit caller assertion,
+so the tool schema makes it required and recall never fills it in from the
+detected project. A blank value is refused locally with no request. Any HTTP
+error answer (the client's `last_error_status` is set) comes back as `Engram
+refused the update of #<id>: ...` with the server's reason, without the "is
+`engram serve` running?" hint. A transport failure (refused, unreachable, timed
+out) keeps the hint. Engram 2.0.0 through 2.2.1 never read the query string in
+`handleUpdateObservation` (it calls `store.UpdateObservation(id, body)`), so
+there the parameter has no effect.
 
 ## Capture high-water mark
 

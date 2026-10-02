@@ -394,6 +394,49 @@ def test_spawn_uses_exact_args_and_detached_popen_options(
     assert waited[0] != threading.current_thread().name
 
 
+def test_spawn_enables_cloud_autosync_without_touching_our_environment(
+    monkeypatch: pytest.MonkeyPatch, local_port: int, fake_bin: Path, tmp_path: Path
+) -> None:
+    # gentle-engram 0.2.0 (2f1e545) spawns `engram serve` with
+    # ENGRAM_CLOUD_AUTOSYNC=1 on top of the inherited environment.
+    monkeypatch.delenv("ENGRAM_CLOUD_AUTOSYNC", raising=False)
+    monkeypatch.setenv("RECALL_TEST_MARKER", "inherited")
+    seen: list[dict[str, Any]] = []
+    started: list[FakeEngram] = []
+
+    class FakeChild:
+        pid = 4243
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    def fake_popen(args: Any, **kwargs: Any) -> FakeChild:
+        seen.append(kwargs)
+        fake = FakeEngram(port=local_port)
+        fake.route("GET", "/health", (200, health_payload(INSTANCE_ID)))
+        started.append(fake)
+        return FakeChild()
+
+    monkeypatch.setattr(server_module, "_popen", fake_popen)
+    try:
+        status = ensure_server(make_config(f"http://127.0.0.1:{local_port}"), str(tmp_path))
+    finally:
+        for fake in started:
+            fake.stop()
+
+    assert status.status == STARTED
+    env = seen[0]["env"]
+    assert env["ENGRAM_CLOUD_AUTOSYNC"] == "1"
+    # A copy of ours: ENGRAM_PORT and data-dir settings must still reach the child.
+    assert env["RECALL_TEST_MARKER"] == "inherited"
+    assert env["ENGRAM_PORT"] == os.environ["ENGRAM_PORT"]
+    assert env is not os.environ
+    assert "ENGRAM_CLOUD_AUTOSYNC" not in os.environ
+
+
 def test_missing_binary_is_unavailable_with_a_clear_reason(
     local_port: int, tmp_path: Path, no_spawn: list[Any]
 ) -> None:

@@ -74,6 +74,12 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
 - [x] T10 Live install on the owner's Hermes (authorized): hermes-recall v0.2.0,
       `memory.provider recall`, keep the Engram MCP for now, hermes-odd v0.7.0;
       owner sends /restart. Route: inline.
+- [x] T11 v0.3.0 Engram v3 compatibility (gentle-engram 0.2.0 / Engram v3.0.0):
+      `mem_update` requires `expected_project` (PATCH `?expected_project=`, breaking in
+      v3), session registration sends `resume: true` and adopts the server-selected
+      effective id (`<id>:resume:N`), auto-started `engram serve` gets
+      `ENGRAM_CLOUD_AUTOSYNC=1`. Must keep working on Engram 2.0.0.
+      Route: delegated (Pi gentle-ai-worker), then verify + native review.
 - [x] T8 (owned by the hermes-odd session) hermes-odd v0.7.0: doctor detects provider, status shows last memory id,
       install prompt covers hermes-recall, memory pointer adapts. Route: delegated.
 
@@ -144,6 +150,17 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   `memory.provider recall` + hermes-odd 0.7.0 (installed 10:38, not by this
   session); updated recall to 0.2.0 (`40e92ae`). Engram MCP kept. Profile
   `buscador-casa` untouched. Waiting for the owner's /restart.
+
+- T11 Engram v3 compatibility (Pi gentle-ai-worker, test-first): mem_update requires
+  `expected_project`, session registration sends `resume: true` and writes go to the
+  validated effective id, spawned `engram serve` gets `ENGRAM_CLOUD_AUTOSYNC=1`.
+  Independent verify: PASS, 4 minors fixed (echoing fixtures, no-id ack rejected like
+  upstream, `last_error_status` instead of substring matching, docs). Real smoke on
+  isolated ports against Engram 2.0.0 and 3.0.0: resume yields `:resume:2` and stays
+  stable on v3, wrong owner is a 409 on v3, blank owner refused locally. Native review
+  approved (review-e6dd28a6e37b6772, 4 non-blocking advisories: second idempotent /end
+  on 2.0.0 after resume, autosync overrides a user `ENGRAM_CLOUD_AUTOSYNC=0` like
+  upstream, effective-id map bound, tools.py:525). 723 tests.
 
 ## Next step
 

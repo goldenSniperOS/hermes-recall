@@ -99,15 +99,27 @@ class EngramClient:
         """Return the last failure reason on this thread, or ``""`` when healthy."""
         return getattr(self._errors, "message", "")
 
+    @property
+    def last_error_status(self) -> int | None:
+        """HTTP status of the last failure on this thread, when a server answered it.
+
+        ``None`` after a success, and after a failure no server answered: refused,
+        unreachable, timed out, or refused locally before any request. The structured
+        twin of :meth:`last_error_text`, so a caller can tell "Engram said no" from
+        "Engram is not there" without parsing the reason.
+        """
+        return getattr(self._errors, "status", None)
+
     # -- Transport -----------------------------------------------------------
 
-    def _record_error(self, message: str) -> None:
-        """Store a failure reason and log it at debug level only.
+    def _record_error(self, message: str, status: int | None = None) -> None:
+        """Store a failure reason (and its HTTP status, if any) and log it at debug only.
 
         Never above debug: the provider is fail-soft, and an Engram server that
         is simply not running would otherwise print a warning on every turn.
         """
         self._errors.message = message
+        self._errors.status = status
         logger.debug("engram client: %s", message)
 
     def _request(
@@ -156,6 +168,7 @@ class EngramClient:
             with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read()
             self._errors.message = ""
+            self._errors.status = None
             if not raw:
                 return None
             try:
@@ -169,7 +182,7 @@ class EngramClient:
             # Never include the request body in the recorded reason: it carries
             # user content (observation text, prompts, search queries).
             detail = _http_error_detail(exc)
-            self._record_error(f"{method} {path}: HTTP {exc.code}{detail}")
+            self._record_error(f"{method} {path}: HTTP {exc.code}{detail}", exc.code)
             return None
         except urllib.error.URLError as exc:
             self._record_error(f"{method} {path}: unreachable ({exc.reason})")
@@ -226,11 +239,21 @@ class EngramClient:
     def create_session(
         self, session_id: str, project: str, directory: str = ""
     ) -> dict[str, Any] | None:
-        """``POST /sessions`` → ``{"id", "status"}`` (HTTP 201)."""
+        """``POST /sessions`` → ``{"id", "status"}`` (HTTP 201).
+
+        Always sent with ``"resume": true``, as gentle-engram 0.2.0 does (Engram v3,
+        6af3a4b): when ``session_id`` already ended, the server picks the lowest live
+        ``<id>:resume:<N>`` continuation (or the next ordinal) and answers with that
+        ``id`` plus ``"resumed_from"``. Without it v2.2+ answers 409
+        ``session_already_ended``; Engram 2.0.0 ignores the field and echoes the id.
+        The ack is returned unchanged — validating the selected id is the caller's job,
+        since only the caller knows which runtime session it registered for.
+        """
         body: dict[str, Any] = {
             "id": session_id,
             "project": project,
             "ownership_mode": "project_owned",
+            "resume": True,
         }
         if directory.strip():
             body["directory"] = directory
@@ -291,8 +314,10 @@ class EngramClient:
                 body[key] = value
         return _as_dict(self._request("POST", "/observations", body=body))
 
-    def update_observation(self, observation_id: int, **fields: Any) -> dict[str, Any] | None:
-        """``PATCH /observations/{id}`` → the full updated observation.
+    def update_observation(
+        self, observation_id: int, *, expected_project: str = "", **fields: Any
+    ) -> dict[str, Any] | None:
+        """``PATCH /observations/{id}?expected_project=`` → the full updated observation.
 
         Only the keys explicitly passed are sent. The server's patch params are
         **pointers** (``store.UpdateObservationParams``), so an absent key and an
@@ -300,6 +325,12 @@ class EngramClient:
         alone", empty means "set it to empty". Dropping ``None`` preserves that
         distinction while giving callers a way to say "not this one"; unknown
         keys are ignored rather than forwarded.
+
+        ``expected_project`` is the caller's assertion of who owns the observation.
+        Engram v3 (e8c0ce3) requires it as a query param — 400 when missing, 409
+        when it does not match the owner — and treats it as an explicit claim, never
+        a default, so it is not defaulted here either. Engram 2.0.0 through 2.2.1 never
+        read the query string on this route, so there it has no effect.
         """
         body = {
             key: value
@@ -312,7 +343,21 @@ class EngramClient:
                 f"PATCH /observations/{observation_id}: refused locally, no updatable fields given"
             )
             return None
-        return _as_dict(self._request("PATCH", f"/observations/{observation_id}", body=body))
+        expected = expected_project.strip() if isinstance(expected_project, str) else ""
+        if not expected:
+            # Engram v3 400s it ("expected_project must be a valid non-empty project name").
+            self._record_error(
+                f"PATCH /observations/{observation_id}: refused locally, blank expected_project"
+            )
+            return None
+        return _as_dict(
+            self._request(
+                "PATCH",
+                f"/observations/{observation_id}",
+                params={"expected_project": expected},
+                body=body,
+            )
+        )
 
     def get_observation(self, observation_id: int) -> dict[str, Any] | None:
         """``GET /observations/{id}`` → the observation, or ``None`` when missing."""

@@ -46,6 +46,11 @@ def make_config(url: str, **over: Any) -> RecallConfig:
     return RecallConfig(**values)
 
 
+def echo_session(request: RecordedRequest) -> tuple[int, Any]:
+    """Acknowledge ``POST /sessions`` with the id it was sent, as Engram 2.0.0 does."""
+    return (201, {"id": request.json_body["id"], "status": "created"})
+
+
 def wire_engram(
     fake: FakeEngram,
     *,
@@ -58,7 +63,7 @@ def wire_engram(
     fake.route("GET", "/search", (200, [hit]))
     fake.route("GET", "/context", (200, {"context": "## Recent\n- did a thing"}))
     fake.route("GET", "/context/compaction", (200, {"context": compaction_context}))
-    fake.route("POST", "/sessions", (201, {"id": SESSION, "status": "created"}))
+    fake.route("POST", "/sessions", echo_session)
     fake.route("POST", "/observations", (201, {"id": 900, "status": "saved"}))
     fake.route(
         "POST", "/observations/passive", (200, {"extracted": 1, "saved": 1, "duplicates": 0})
@@ -80,6 +85,18 @@ def end_requests(fake: FakeEngram) -> list[RecordedRequest]:
         r
         for r in fake.requests
         if r.method == "POST" and r.path.startswith("/sessions/") and r.path.endswith("/end")
+    ]
+
+
+def assert_registered_and_used(fake: FakeEngram, provider: RecallProvider, session_id: str) -> None:
+    """``session_id`` was accepted by Engram, and a later write lands on it unregistered."""
+    assert provider._registered_session_id == session_id
+    assert provider._effective_session_id(session_id) == session_id
+    fake.reset()
+    provider.on_turn_start(1, "a question asked in the new session")
+    assert provider._drain_for_test()
+    assert [(r.path, r.json_body["session_id"]) for r in fake.requests if r.method == "POST"] == [
+        ("/prompts", session_id)
     ]
 
 
@@ -226,6 +243,7 @@ def test_switch_with_reset_ends_the_old_session_and_registers_the_new_one(
     assert registered.json_body["id"] == NEXT_SESSION
     assert registered.json_body["project"] == PROJECT
     assert provider._session_id == NEXT_SESSION
+    assert_registered_and_used(fake_engram, provider, NEXT_SESSION)
 
 
 def test_switch_without_reset_registers_but_does_not_end(
@@ -244,6 +262,7 @@ def test_switch_without_reset_registers_but_does_not_end(
     registered = fake_engram.find("POST", "/sessions")
     assert registered is not None
     assert registered.json_body["id"] == NEXT_SESSION
+    assert_registered_and_used(fake_engram, provider, NEXT_SESSION)
 
 
 def test_the_hosts_rotation_order_ends_the_session_exactly_once(
@@ -409,6 +428,7 @@ def test_a_rewind_with_a_changed_session_id_is_a_real_switch(
 
     assert provider._session_id == NEXT_SESSION
     assert fake_engram.find("POST", "/sessions") is not None
+    assert_registered_and_used(fake_engram, provider, NEXT_SESSION)
 
 
 def test_switch_to_the_same_id_does_not_end_it(

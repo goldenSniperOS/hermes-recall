@@ -51,10 +51,15 @@ def make_config(url: str, **over: Any) -> RecallConfig:
     return RecallConfig(**values)
 
 
+def echo_session(request: RecordedRequest) -> tuple[int, Any]:
+    """Acknowledge ``POST /sessions`` with the id it was sent, as Engram 2.0.0 does."""
+    return (201, {"id": request.json_body["id"], "status": "created"})
+
+
 def wire_engram(fake: FakeEngram, *, project: str = PROJECT) -> None:
     """Route the endpoints the capture paths touch."""
     fake.route("GET", "/project/current", (200, {"project": project}))
-    fake.route("POST", "/sessions", (201, {"id": SESSION, "status": "created"}))
+    fake.route("POST", "/sessions", echo_session)
     fake.route("POST", "/prompts", (201, {"id": 12, "status": "saved"}))
     fake.route(
         "POST", "/observations/passive", (200, {"extracted": 1, "saved": 1, "duplicates": 0})

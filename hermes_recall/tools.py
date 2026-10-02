@@ -122,13 +122,18 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "Update fields of an existing observation.",
         {
             "id": _ID,
+            # Required since Engram v3 (e8c0ce3): the caller asserts the owner, as
+            # gentle-engram 0.2.0 does. Never defaulted to the detected project.
+            "expected_project": _s(
+                "Project that owns the observation; must match or the update is refused"
+            ),
             "title": _s("New title"),
             "content": _s("New content"),
             "type": _s("New type"),
             "scope": _s("New scope"),
             "topic_key": _s("New topic key"),
         },
-        ["id"],
+        ["id", "expected_project"],
     ),
     _schema("mem_get_observation", "Get one observation in full.", {"id": _ID}, ["id"]),
     _schema(
@@ -199,6 +204,17 @@ class ToolEnv:
     agent_context: str
     resolve_project: Callable[[], str]
     register_session: Callable[[str], bool]
+    # The Engram session id writes go to, resolved at call time: ``session_id`` is
+    # the Hermes runtime id, and once Engram v3 resumed it as ``<id>:resume:<N>``
+    # the registration's acknowledged id is the one to write under. ``None`` (no
+    # resolver) means the runtime id itself.
+    effective_session_id: Callable[[], str] | None = None
+
+    def write_session_id(self) -> str:
+        """The session id to attribute a write to right now."""
+        if self.effective_session_id is None:
+            return self.session_id
+        return self.effective_session_id() or self.session_id
 
 
 class ToolError(Exception):
@@ -391,8 +407,10 @@ def _save(
         raise ToolError("no active Hermes session to save under")
 
     def post() -> dict[str, Any] | None:
+        # Resolved per attempt: the retry's registration may have selected a
+        # continuation of the session.
         return env.client.add_observation(
-            env.session_id,
+            env.write_session_id(),
             title,
             content,
             type_=type_,
@@ -486,6 +504,12 @@ def _mem_session_summary(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
 
 def _mem_update(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
     observation_id = _id_arg(args, "id")
+    expected_project = _str_arg(args, "expected_project")
+    if not expected_project:
+        raise ToolError(
+            "'expected_project' is required: the project that owns the observation "
+            f"(mem_get_observation #{observation_id} shows it)"
+        )
     fields: dict[str, Any] = {}
     for key in ("title", "content", "type", "scope", "topic_key"):
         if args.get(key) is None:
@@ -494,8 +518,16 @@ def _mem_update(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
         fields[key] = strip_private(value) if key in ("title", "content") else value
     if not fields:
         raise ToolError("give at least one of: title, content, type, scope, topic_key")
-    updated = env.client.update_observation(observation_id, **fields)
+    updated = env.client.update_observation(
+        observation_id, expected_project=expected_project, **fields
+    )
     if updated is None:
+        if env.client.last_error_status is not None:
+            # A server answered (409 owner mismatch, 400 invalid patch, 404, ...):
+            # asking the model whether `engram serve` is running would send it the
+            # wrong way.
+            reason = env.client.last_error_text()
+            raise ToolError(f"Engram refused the update of #{observation_id}: {reason}")
         raise _engram_error(env, "update")
     project = updated.get("project") if isinstance(updated.get("project"), str) else ""
     _remember(env, observation_id, "updated", project or env.resolve_project())
@@ -561,7 +593,7 @@ def _mem_judge(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
         reason=_str_arg(args, "reason"),
         evidence=_str_arg(args, "evidence"),
         confidence=confidence,
-        session_id=env.session_id,
+        session_id=env.write_session_id(),
     )
     if judged is None:
         raise _engram_error(env, "judge")

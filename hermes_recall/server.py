@@ -408,9 +408,12 @@ def _spawn_serve(binary: str, hermes_home: str) -> Any:
     (Windows), inherited fds closed, cwd the recall state directory (never the
     user's repository). The environment is inherited on purpose: ``ENGRAM_PORT``
     and Engram's data-dir settings must reach the child, or it would serve another
-    port or store. Output goes to ``<hermes_home>/recall/engram-serve.log`` when that
-    can be opened. The child is never killed: it outlives this process on purpose;
-    a daemon thread only reaps its exit status (:func:`_reap`).
+    port or store. It is a copy plus ``ENGRAM_CLOUD_AUTOSYNC=1``, as gentle-engram
+    spawns it (2f1e545); the server skips autosync itself when no cloud server or
+    token is configured, and our own ``os.environ`` is never touched. Output goes
+    to ``<hermes_home>/recall/engram-serve.log`` when that can be opened. The child
+    is never killed: it outlives this process on purpose; a daemon thread only reaps
+    its exit status (:func:`_reap`).
     """
     log_handle: Any = None
     directory: Path | None = None
@@ -433,6 +436,7 @@ def _spawn_serve(binary: str, hermes_home: str) -> Any:
         "stderr": subprocess.STDOUT if log_handle is not None else subprocess.DEVNULL,
         "close_fds": True,
         "cwd": str(directory) if directory is not None else None,
+        "env": {**os.environ, "ENGRAM_CLOUD_AUTOSYNC": "1"},
     }
     if sys.platform == "win32":  # pragma: no cover - not exercised on POSIX CI
         options["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(

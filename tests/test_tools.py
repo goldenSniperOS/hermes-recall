@@ -69,9 +69,14 @@ def unused_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def echo_session(request: RecordedRequest) -> tuple[int, Any]:
+    """Acknowledge ``POST /sessions`` with the id it was sent, as Engram 2.0.0 does."""
+    return (201, {"id": request.json_body["id"], "status": "created"})
+
+
 def wire(fake: FakeEngram) -> None:
     fake.route("GET", "/project/current", (200, {"project": PROJECT}))
-    fake.route("POST", "/sessions", (201, {"id": SESSION, "status": "created"}))
+    fake.route("POST", "/sessions", echo_session)
     fake.route("POST", "/observations", (201, {"id": 900, "status": "saved"}))
     fake.route("GET", "/observations/761", (200, OBSERVATION))
     fake.route("PATCH", "/observations/761", (200, {**OBSERVATION, "title": "New"}))
@@ -363,6 +368,15 @@ def test_mem_session_summary_request_status_and_state(
 # -- mem_update ---------------------------------------------------------------
 
 
+def test_mem_update_requires_an_explicit_expected_project() -> None:
+    # gentle-engram 0.2.0 / Engram v3 (e8c0ce3): the owner is a caller assertion.
+    schema = next(s for s in tools_module.get_tool_schemas() if s["name"] == "mem_update")
+    params = schema["parameters"]
+    assert params["required"] == ["id", "expected_project"]
+    assert params["properties"]["expected_project"]["type"] == "string"
+    assert "must match" in params["properties"]["expected_project"]["description"]
+
+
 def test_mem_update_sends_only_given_fields(
     fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
 ) -> None:
@@ -370,12 +384,13 @@ def test_mem_update_sends_only_given_fields(
     provider = make_provider(fake_engram.base_url)
     fake_engram.reset()
 
-    result = call(provider, "mem_update", id=761, title="New", scope="personal")
+    result = call(
+        provider, "mem_update", id=761, expected_project=PROJECT, title="New", scope="personal"
+    )
 
-    assert only(fake_engram, "PATCH", "/observations/761").json_body == {
-        "title": "New",
-        "scope": "personal",
-    }
+    request = only(fake_engram, "PATCH", "/observations/761")
+    assert request.json_body == {"title": "New", "scope": "personal"}
+    assert request.query == {"expected_project": [PROJECT]}
     assert result["id"] == 761
     assert result["status"] == "🧠 updated #761"
     assert result["observation"]["title"] == "New"
@@ -383,12 +398,138 @@ def test_mem_update_sends_only_given_fields(
     assert (state["last_memory_id"], state["last_action"]) == (761, "updated")
 
 
+def test_mem_update_forwards_the_callers_project_not_the_detected_one(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    call(provider, "mem_update", id=761, expected_project="  other-project ", title="New")
+
+    request = only(fake_engram, "PATCH", "/observations/761")
+    assert request.query_one("expected_project") == "other-project"
+
+
+@pytest.mark.parametrize("expected_project", [None, "", "   "])
+def test_mem_update_without_expected_project_is_refused_before_any_request(
+    fake_engram: FakeEngram, make_provider: Any, expected_project: Any
+) -> None:
+    # Never defaulted to the detected project: a guessed owner would defeat the check.
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    args: dict[str, Any] = {"id": 761, "title": "New"}
+    if expected_project is not None:
+        args["expected_project"] = expected_project
+    error = call(provider, "mem_update", **args)["error"]
+
+    assert "'expected_project' is required" in error
+    assert "mem_get_observation" in error
+    assert fake_engram.requests == []
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (409, "expected_project does not match observation owner"),
+        (409, "observation project cannot be reassigned"),
+        (400, "expected_project must be a valid non-empty project name"),
+    ],
+)
+def test_mem_update_surfaces_a_refusal_as_a_readable_error(
+    fake_engram: FakeEngram,
+    make_provider: Any,
+    tmp_path: Path,
+    status: int,
+    message: str,
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("PATCH", "/observations/761", (status, {"error": message}))
+    provider = make_provider(fake_engram.base_url)
+
+    error = call(provider, "mem_update", id=761, expected_project="other", title="New")["error"]
+
+    assert f"HTTP {status} {message}" in error
+    assert "Engram refused the update of #761" in error
+    # A server answered, so "is it running?" would send the model the wrong way.
+    assert "engram serve" not in error
+    assert not state_path(tmp_path).exists()
+
+
+class _StubUpdateClient:
+    """A client whose update fails with a chosen reason and status, and nothing else."""
+
+    def __init__(self, reason: str, status: int | None) -> None:
+        self._reason = reason
+        self.last_error_status = status
+
+    def update_observation(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def last_error_text(self) -> str:
+        return self._reason
+
+
+def _stub_env(client: Any) -> tools_module.ToolEnv:
+    return tools_module.ToolEnv(
+        client=client,
+        session_id=SESSION,
+        hermes_home="/nonexistent",
+        writes_enabled=True,
+        agent_context="primary",
+        resolve_project=lambda: PROJECT,
+        register_session=lambda _project: True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "status", "refused"),
+    [
+        # The HTTP status decides, never the wording of the reason.
+        ("PATCH /observations/761: owner mismatch", 409, True),
+        ("PATCH /observations/761: HTTP 404 observation not found", 404, True),
+        ("PATCH /observations/761: HTTP 500 database is locked", 500, True),
+        ("PATCH /observations/761: unreachable (proxy said: HTTP 502)", None, False),
+        ("PATCH /observations/761: timed out after 3s", None, False),
+    ],
+)
+def test_mem_update_classifies_failures_by_http_status(
+    reason: str, status: int | None, refused: bool
+) -> None:
+    raw = tools_module.handle_tool_call(
+        _stub_env(_StubUpdateClient(reason, status)),
+        "mem_update",
+        {"id": 761, "expected_project": PROJECT, "title": "T"},
+    )
+    error = json.loads(raw)["error"]
+
+    assert reason in error
+    if refused:
+        assert error.startswith("Engram refused the update of #761: ")
+        assert "engram serve" not in error
+    else:
+        assert error.startswith("Engram update failed: ")
+        assert "engram serve" in error
+
+
+def test_mem_update_keeps_the_hint_when_engram_is_down(make_provider: Any) -> None:
+    provider = make_provider(f"http://127.0.0.1:{unused_port()}")
+
+    error = call(provider, "mem_update", id=761, expected_project=PROJECT, title="T")["error"]
+
+    assert "Is `engram serve` running?" in error
+    assert "refused the update" not in error
+
+
 def test_mem_update_accepts_a_numeric_string_id(
     fake_engram: FakeEngram, make_provider: Any
 ) -> None:
     wire(fake_engram)
     provider = make_provider(fake_engram.base_url)
-    assert call(provider, "mem_update", id="#761", content="c")["status"] == "🧠 updated #761"
+    result = call(provider, "mem_update", id="#761", expected_project=PROJECT, content="c")
+    assert result["status"] == "🧠 updated #761"
 
 
 def test_mem_update_rejects_bad_ids_and_empty_patches(
@@ -399,8 +540,9 @@ def test_mem_update_rejects_bad_ids_and_empty_patches(
     fake_engram.reset()
 
     for bad in (0, -1, True, "abc", None, 1.5):
-        assert "id" in call(provider, "mem_update", id=bad, title="x")["error"]
-    assert "at least one" in call(provider, "mem_update", id=761)["error"]
+        error = call(provider, "mem_update", id=bad, expected_project=PROJECT, title="x")["error"]
+        assert "id" in error
+    assert "at least one" in call(provider, "mem_update", id=761, expected_project=PROJECT)["error"]
     assert fake_engram.requests == []
 
 
@@ -559,7 +701,7 @@ def test_mem_pin_missing_observation_is_an_error(
     ("name", "args"),
     [
         ("mem_save", {"title": "T", "content": "C"}),
-        ("mem_update", {"id": 761, "title": "T"}),
+        ("mem_update", {"id": 761, "expected_project": "p", "title": "T"}),
         ("mem_session_summary", {"content": "C"}),
         ("mem_judge", {"judgment_id": "r", "relation": "related"}),
         ("mem_pin", {"id": 761}),
@@ -602,7 +744,7 @@ def test_non_primary_read_tools_still_work(fake_engram: FakeEngram, make_provide
     [
         ("mem_search", {"query": "x"}),
         ("mem_save", {"title": "T", "content": "C", "project": "p"}),
-        ("mem_update", {"id": 761, "title": "T"}),
+        ("mem_update", {"id": 761, "expected_project": "p", "title": "T"}),
         ("mem_get_observation", {"id": 761}),
         ("mem_context", {"project": "p"}),
         ("mem_session_summary", {"content": "C", "project": "p"}),
