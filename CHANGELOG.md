@@ -6,6 +6,27 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-02
+
+Compatibility with Engram v3.0.0 (and gentle-engram 0.2.0). Engram 2.0.0
+keeps working.
+
+### Changed
+
+- **Breaking for the model:** `mem_update` now requires `expected_project`,
+  the project that owns the observation. It is sent as
+  `PATCH /observations/{id}?expected_project=` and is never filled in from the
+  detected project. Engram v3 refuses an update without it (400) or with the
+  wrong owner (409); the refusal comes back as a readable tool error. A blank
+  value is refused locally before any request.
+- Session registration sends `"resume": true`. When Hermes resumes a session
+  Engram already ended, Engram v3 picks a live `<id>:resume:<N>` continuation
+  and every write of that session, including its end, goes there. Before, the
+  registration was refused with `session_already_ended` and writes failed.
+  The acknowledged id is validated the way gentle-engram does it.
+- An `engram serve` started by recall runs with `ENGRAM_CLOUD_AUTOSYNC=1`,
+  like gentle-engram's. The server skips autosync when no cloud is configured.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

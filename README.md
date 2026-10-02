@@ -49,7 +49,7 @@ way around.
   brew install gentleman-programming/tap/engram
   ```
 
-  Tested with Engram 2.0.0. You no longer need to start `engram serve` by
+  Tested with Engram 2.0.0 and 3.0.0. You no longer need to start `engram serve` by
   hand: when no server answers, hermes-recall starts one for you (see
   [Engram server](#engram-server)).
 
