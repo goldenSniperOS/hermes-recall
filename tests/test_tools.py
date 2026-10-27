@@ -182,6 +182,61 @@ def test_mem_search_request_and_result(fake_engram: FakeEngram, make_provider: A
     assert hit["snippet"].startswith("**What**: chose urllib")
 
 
+def test_mem_search_renders_compact_hits_with_their_pin(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    compact = {
+        "id": 761,
+        "sync_id": "obs-1",
+        "title": "Use stdlib urllib",
+        "type": "decision",
+        "state": "active",
+        "scope": "project",
+        "pinned": True,
+        "preview": "**What**: chose\nurllib",
+        "truncated": True,
+        "project": PROJECT,
+    }
+    unpinned = {**compact, "id": 762, "pinned": False}
+    fake_engram.route(
+        "GET", "/search", (200, {"result": "Found 2 memories.", "results": [compact, unpinned]})
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_search", query="urllib")
+
+    assert only(fake_engram, "GET", "/search").query_one("response_format") == "compact"
+    assert result["count"] == 2
+    first, second = result["results"]
+    assert first == {
+        "id": 761,
+        "type": "decision",
+        "title": "Use stdlib urllib",
+        "project": PROJECT,
+        "scope": "project",
+        "pinned": True,
+        "snippet": "**What**: chose urllib",
+    }
+    assert "pinned" not in second
+
+
+def test_mem_search_on_a_legacy_bare_array_server_still_works(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    # Engram < 3.6 ignores response_format and answers the full bare array.
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_search", query="urllib")
+
+    assert only(fake_engram, "GET", "/search").query_one("response_format") == "compact"
+    assert result["results"][0]["snippet"].startswith("**What**: chose urllib")
+    assert "pinned" not in result["results"][0]
+
+
 def test_mem_search_all_projects_drops_project_and_clamps_limit(
     fake_engram: FakeEngram, make_provider: Any
 ) -> None:

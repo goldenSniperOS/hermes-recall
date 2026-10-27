@@ -138,7 +138,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 - [x] T12 S2+S4+S8 client error bodies, history, judge-many, refusal wording. Route: inline.
 - [x] T13 S3 mem_consolidate. Route: inline.
 - [x] T14 S5 mem_session_finalize + end suppression. Route: inline.
-- [ ] T15 S1 compact search (tool + prefetch). Route: inline.
+- [x] T15 S1 compact search (tool + prefetch). Route: inline.
 - [ ] T16 S6 capture provenance. Route: inline (own commit; writes data).
 - [ ] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
 - [ ] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
@@ -197,6 +197,11 @@ writers; done inline, test-first, in ~400-line commits.
   the runtime id without pre-registering, as after `on_session_end` since T11;
   background writes pre-register and land in the continuation. Schema payload with
   13 tools: 5564 bytes.
+- L8 Decisions (T15, worker): `pinned` is surfaced in a tool hit only when true
+  (an unpinned hit carries no key, saving tokens); `state`, `truncated`,
+  `review_after` and `relations` from the compact projection are not forwarded.
+  The snippet comes from `content` (legacy), else `preview`; the client unwraps a
+  compact answer whose `results` is not a list to `[]`.
 
 ## Acceptance criteria
 
@@ -286,6 +291,8 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 - T12 history, mem_judge_many, refusal-aware errors: `bbc981f` (Pi gentle-ai-worker,
   test-first).
 - T13 mem_consolidate: `8d78676` (Pi gentle-ai-worker, test-first).
+- T14 mem_session_finalize + /end suppression: `2f7e74a` (Pi gentle-ai-worker,
+  test-first).
 
 ## Next step
 

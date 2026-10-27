@@ -136,6 +136,8 @@ def test_search_request_shape(fake_engram: FakeEngram) -> None:
     # blank `project` outright and uses absence to pick its own defaults.
     assert "type" not in request.query
     assert "scope" not in request.query
+    # Engram 3.6 previews; older servers ignore the param.
+    assert request.query_one("response_format") == "compact"
 
 
 def test_search_all_projects_replaces_project(fake_engram: FakeEngram) -> None:
@@ -207,6 +209,21 @@ def test_search_returns_the_list_on_success(fake_engram: FakeEngram) -> None:
     fake_engram.route("GET", "/search", (200, hits))
 
     assert client_for(fake_engram).search("auth") == hits
+
+
+def test_search_unwraps_the_compact_answer(fake_engram: FakeEngram) -> None:
+    hits = [{"id": 1, "title": "Fixed auth", "preview": "body", "truncated": False}]
+    fake_engram.route("GET", "/search", (200, {"result": "Found 1 memories.", "results": hits}))
+
+    assert client_for(fake_engram).search("auth") == hits
+
+
+def test_search_treats_a_compact_answer_without_a_results_list_as_empty(
+    fake_engram: FakeEngram,
+) -> None:
+    fake_engram.route("GET", "/search", (200, {"result": "No memories", "results": None}))
+
+    assert client_for(fake_engram).search("auth") == []
 
 
 # -- 7. add_observation -------------------------------------------------------

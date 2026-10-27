@@ -422,6 +422,39 @@ def test_prefetch_builds_the_search_request(fake_engram: FakeEngram, provider_fa
     assert request.query_one("match_mode") == "any"
 
 
+def test_prefetch_renders_compact_hits_from_their_preview(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    compact = {"id": 761, "type": "decision", "title": "Memory 761", "preview": "a preview"}
+    fake_engram.route(
+        "GET", "/search", (200, {"result": "Found 1 memories.", "results": [compact]})
+    )
+    provider = provider_factory(fake_engram.base_url)
+
+    text = provider.prefetch("why does the loader skip my provider")
+
+    request = fake_engram.find("GET", "/search")
+    assert request is not None
+    assert request.query_one("response_format") == "compact"
+    assert "#761 [decision] Memory 761: a preview" in text
+    assert provider.recall_status().count == 1
+
+
+def test_prefetch_on_a_legacy_server_renders_the_bare_array(
+    fake_engram: FakeEngram, provider_factory: Any
+) -> None:
+    wire_engram(fake_engram)
+    provider = provider_factory(fake_engram.base_url)
+
+    text = provider.prefetch("why does the loader skip my provider")
+
+    request = fake_engram.find("GET", "/search")
+    assert request is not None
+    assert request.query_one("response_format") == "compact"
+    assert "#761 [decision] Memory 761: **What**: a thing" in text
+
+
 def test_prefetch_truncates_a_long_query(fake_engram: FakeEngram, provider_factory: Any) -> None:
     wire_engram(fake_engram)
     provider = provider_factory(fake_engram.base_url)

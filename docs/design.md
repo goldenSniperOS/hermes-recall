@@ -31,7 +31,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | Hermes surface | Engram endpoint | Notes |
 | --- | --- | --- |
 | `initialize` | `GET /health` (+ `engram instance-id`, maybe `engram serve`), `GET /project/current?cwd=`, `POST /sessions` | Background; primary context only; server ensured before registration; registration retried by later writes if it fails |
-| `prefetch` | `GET /search`, `GET /context` (once per session) | Trivial prompts skipped; 4 s budget |
+| `prefetch` | `GET /search?response_format=compact`, `GET /context` (once per session) | Trivial prompts skipped; 4 s budget; hits render from `content`, else the compact `preview` |
 | `queue_prefetch` | `GET /project/current` (until detected) | Warms project detection only; no search, never consumes the `/context` flag |
 | `recall_status` | — | `🧠 Recall · <project> — recalled N memories`, rendered by Hermes |
 | `on_turn_start` | `POST /prompts` | `<private>` redacted, 2000-char cap |
@@ -39,7 +39,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `on_delegation` | `POST /observations/passive` (`source=subagent`) | Task / result redacted, then capped at 1000 / 4000 chars |
 | `on_pre_compress` | `POST /observations` (`session_summary`), `GET /context/compaction` | Synchronous, 7 s budget, idempotent by hash |
 | `on_session_switch` / `on_session_end` | `POST /sessions` (`resume: true`), `POST /sessions/{id}/end` | `/end` de-duplicated; ends the effective session id; skipped after `mem_session_finalize` |
-| `mem_search` | `GET /search` | Default project = detected project |
+| `mem_search` | `GET /search?response_format=compact` | Default project = detected project; accepts the compact `{result, results}` answer and the legacy bare array; `pinned: true` surfaced; snippet from `content` or `preview` |
 | `mem_save` | `POST /observations` | Registers the session and retries once on `session not found` |
 | `mem_update` | `PATCH /observations/{id}?expected_project=` | `expected_project` required, never defaulted; only given fields are sent |
 | `mem_get_observation` | `GET /observations/{id}` (`?include_history=true&history_cursor=`) | History keys lifted out of `observation`; each version's content capped; an Engram without history gets a `history_note` |

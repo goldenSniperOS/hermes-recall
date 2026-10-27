@@ -470,7 +470,10 @@ def _compact_hit(hit: dict[str, Any]) -> dict[str, Any]:
         for key in ("id", "type", "title", "project", "scope", "topic_key", "created_at")
         if hit.get(key) not in (None, "")
     }
-    content = hit.get("content")
+    if hit.get("pinned") is True:
+        compact["pinned"] = True
+    # Legacy hits carry the full `content`, compact ones (Engram 3.6) a `preview`.
+    content = hit.get("content") or hit.get("preview")
     if isinstance(content, str) and content:
         compact["snippet"] = truncate(" ".join(content.split()), SEARCH_SNIPPET_MAX_CHARS)
     return compact

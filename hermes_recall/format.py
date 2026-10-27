@@ -30,8 +30,10 @@ def render_hit(hit: dict) -> str:
 
     Shape: ``#<id> [<type>] <title>: <snippet>``.
 
-    The snippet comes from ``hit["content"]``. Verified against a live Engram
-    2.0.0 server: search hits carry **no** ``snippet`` field. Their real fields are
+    The snippet comes from ``hit["content"]``, else from ``hit["preview"]`` (Engram
+    3.6 ``response_format=compact`` hits carry a bounded preview and no content).
+    Verified against a live Engram 2.0.0 server: legacy search hits carry **no**
+    ``snippet`` field. Their real fields are
     ``id`` (int), ``sync_id``, ``session_id``, ``type``, ``title``, ``content``,
     ``project``, ``scope``, ``topic_key``, ``revision_count``, ``duplicate_count``,
     ``last_seen_at``, ``created_at``, ``updated_at`` and ``rank`` (float).
@@ -49,7 +51,7 @@ def render_hit(hit: dict) -> str:
             return ""
         type_ = _text_field(hit, "type", "memory")
         title = _text_field(hit, "title", "(untitled)")
-        snippet = _snippet(hit.get("content"))
+        snippet = _snippet(_hit_text(hit))
         line = f"#{identifier} [{type_}] {title}"
         return f"{line}: {snippet}" if snippet else line
     except Exception:
@@ -251,6 +253,14 @@ def _hit_id(value: Any) -> str:
         text = value.strip()
         return text if text.isdigit() else ""
     return ""
+
+
+def _hit_text(hit: dict) -> Any:
+    """The hit's body: ``content`` (legacy search), else the compact ``preview``."""
+    content = hit.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    return hit.get("preview")
 
 
 def _text_field(hit: dict, key: str, fallback: str) -> str:

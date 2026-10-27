@@ -49,6 +49,18 @@ def test_render_hit_shape() -> None:
     )
 
 
+def test_render_hit_uses_the_compact_preview_when_there_is_no_content() -> None:
+    # Engram 3.6 `response_format=compact` hits carry `preview`, never `content`.
+    compact = {"id": 761, "type": "decision", "title": "Title", "preview": "a\n  preview"}
+    assert render_hit(compact) == "#761 [decision] Title: a preview"
+
+
+def test_render_hit_prefers_content_over_preview() -> None:
+    assert render_hit(hit(content="full body", preview="cut")) == (
+        "#761 [decision] Chose Engram over MCP: full body"
+    )
+
+
 def test_render_hit_collapses_whitespace_runs() -> None:
     # Observation content is multi-line markdown; newlines would wreck the
     # one-line-per-hit layout the block depends on.

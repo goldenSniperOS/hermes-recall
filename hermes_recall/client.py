@@ -470,13 +470,25 @@ class EngramClient:
         scope: str = "",
         all_projects: bool = False,
     ) -> list[dict[str, Any]]:
-        """``GET /search`` → ranked hits; always a list, ``[]`` on failure."""
+        """``GET /search`` → ranked hits; always a list, ``[]`` on failure.
+
+        Asks for Engram 3.6's ``response_format=compact``: ``{"result", "results"}``
+        whose hits carry a bounded ``preview`` (plus ``pinned``, ``state``,
+        ``truncated``) instead of the full ``content``. Older servers ignore the
+        param and answer the legacy bare array, which is returned unchanged.
+        """
         if not query.strip():
             # The server 400s on a blank `q`, so there is nothing to ask it.
             self._record_error("GET /search: refused locally, blank query")
             return []
 
-        params: dict[str, Any] = {"q": query, "limit": limit, "type": type_, "scope": scope}
+        params: dict[str, Any] = {
+            "q": query,
+            "limit": limit,
+            "type": type_,
+            "scope": scope,
+            "response_format": "compact",
+        }
 
         # `project` and `all_projects` together is a 400, so they are mutually
         # exclusive here, with all_projects winning because it is the explicit ask.
@@ -491,7 +503,7 @@ class EngramClient:
         if normalized_mode in _MATCH_MODES:
             params["match_mode"] = normalized_mode
 
-        return _as_list(self._request("GET", "/search", params=params))
+        return _search_hits(self._request("GET", "/search", params=params))
 
     def context(self, project: str = "", scope: str = "") -> str:
         """``GET /context`` → the formatted context block; ``""`` on failure."""
@@ -725,6 +737,13 @@ def _as_dict(payload: Any) -> dict[str, Any] | None:
 def _as_list(payload: Any) -> list[dict[str, Any]]:
     """Return ``payload`` when it is a list, else ``[]`` — these methods always list."""
     return payload if isinstance(payload, list) else []
+
+
+def _search_hits(payload: Any) -> list[dict[str, Any]]:
+    """The hits of a compact ``{"result", "results"}`` answer or of a legacy bare array."""
+    if isinstance(payload, dict):
+        return _as_list(payload.get("results"))
+    return _as_list(payload)
 
 
 def _as_context(payload: Any) -> str:

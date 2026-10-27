@@ -101,7 +101,7 @@ The model gets these tools (compact schemas, about 5.5 KB in total):
 
 | Tool | Engram endpoint |
 |---|---|
-| `mem_search` | `GET /search` |
+| `mem_search` | `GET /search` (compact previews on Engram >= 3.5.1) |
 | `mem_save` | `POST /observations` |
 | `mem_update` | `PATCH /observations/{id}` |
 | `mem_get_observation` | `GET /observations/{id}` (`include_history` adds prior versions) |
