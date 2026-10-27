@@ -11,7 +11,8 @@ id in ``/odd_status``), so its location, keys and types are frozen:
   ===================  =======  ================================================
   ``last_memory_id``   int      Engram observation id of the last tool result
   ``last_action``      str      ``saved``, ``updated``, ``observation``,
-                                ``pinned``, ``unpinned`` or ``session_summary``
+                                ``pinned``, ``unpinned``, ``session_summary`` or
+                                ``consolidated``
   ``project``          str      Engram project the action ran under (may be "")
   ``updated_at``       str      ISO 8601 UTC timestamp of the write
   ===================  =======  ================================================

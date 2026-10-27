@@ -142,7 +142,9 @@ _QUEUE_MAXSIZE = 256
 # PROVENANCE.md, store.ProjectProvenance.Validate). Anything else is a 400 that
 # would lose the write, so it is replaced by ``unknown``.
 PROVENANCE_UNKNOWN = "unknown"
-PROVENANCE_CONFIG = "config"
+# ``memory.recall.project`` is the caller explicitly naming the project; Engram's
+# ``config`` means its own ``.engram/config.json`` (internal/project/detect.go).
+PROVENANCE_OVERRIDE = "explicit_override"
 PROVENANCE_SOURCES = frozenset(
     {
         "git_remote",
@@ -592,7 +594,7 @@ class RecallProvider(MemoryProvider):
             self._project_source = ""
             override = str(self._config.project_override or "").strip()
             if override:
-                self._project_source = PROVENANCE_CONFIG
+                self._project_source = PROVENANCE_OVERRIDE
                 return override
             if self._foreign_reason():
                 return ""

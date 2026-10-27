@@ -437,7 +437,8 @@ Engram 3.6 accepts optional `project_provenance {source, directory}` evidence on
 those writes, mirroring gentle-engram's `captureProjectProvenance`:
 
 - `source` is the `project_source` from `GET /project/current` when the write's
-  project is the detected project, `config` when `memory.recall.project` set it,
+  project is the detected project, `explicit_override` when `memory.recall.project` set it
+  (Engram's `config` means its own `.engram/config.json`),
   and `unknown` otherwise (a write to another project, or no detection).
 - A detected source outside Engram's accepted set is sent as `unknown`: Engram
   400s an unsupported source, which would lose the whole write.

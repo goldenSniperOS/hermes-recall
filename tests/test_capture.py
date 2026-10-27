@@ -1158,7 +1158,7 @@ def test_a_source_outside_engrams_set_is_sent_as_unknown(
     assert all(p == {"source": "unknown", "directory": WORKDIR} for _, p in rows)
 
 
-def test_a_configured_project_is_sent_as_config(
+def test_a_configured_project_is_sent_as_explicit_override(
     fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
@@ -1169,7 +1169,9 @@ def test_a_configured_project_is_sent_as_config(
 
     rows = provenances(fake_engram)
     assert len(rows) == 8
-    assert all(p == {"source": "config", "directory": WORKDIR} for _, p in rows)
+    # Engram's `config` means `.engram/config.json`; `memory.recall.project` is the
+    # caller explicitly supplying a project name (internal/project/detect.go).
+    assert all(p == {"source": "explicit_override", "directory": WORKDIR} for _, p in rows)
     assert fake_engram.find("GET", "/project/current") is None
 
 

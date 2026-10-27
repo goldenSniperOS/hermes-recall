@@ -31,7 +31,7 @@ without its route answers "needs Engram >= 3.5.1" instead of failing.
   page cursor.
 - Capture writes (`/sessions`, `/observations`, `/observations/passive`,
   `/prompts`) carry `project_provenance {source, directory}`: Engram's detected
-  `project_source`, `config` for `memory.recall.project`, else `unknown`.
+  `project_source`, `explicit_override` for `memory.recall.project`, else `unknown`.
 
 ### Changed
 

@@ -120,7 +120,8 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 - S6 Capture provenance: `project_provenance {source, directory}` on POST `/sessions`,
   `/observations`, `/observations/passive`, `/prompts`. `source` is the detected
   `project_source` when the detected project is the write's project and the value is
-  in Engram's allowed set, `config` for `memory.recall.project`, else `unknown`.
+  in Engram's allowed set, `explicit_override` for `memory.recall.project` (L11), else
+  `unknown`.
   Never sent on `/finalize` (strict body). `/project/current` has no `directory` param
   in 3.6.0 (`cwd` is canonical, already used): not applicable.
 - S7 Protocol: the static system prompt adds the canonical topic workflow (search
@@ -215,6 +216,10 @@ writers; done inline, test-first, in ~400-line commits.
   cache guard). `mem_session_finalize` is suggested only when the user closes or
   hands off the session; ordinary completion still uses `mem_session_summary`.
   README keeps "tested with 2.0.0 and 3.0.0" until T18's live 3.6.0 smoke.
+
+- L11 Decision (T18, parent): `memory.recall.project` provenance is `explicit_override`,
+  not `config`: upstream `internal/project/detect.go` defines `config` as derived from
+  `.engram/config.json` and `explicit_override` as the caller supplying a project name.
 
 ## Acceptance criteria
 
