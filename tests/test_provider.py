@@ -858,7 +858,7 @@ def test_get_tool_schemas_is_stable_and_pure() -> None:
     first = provider.get_tool_schemas()
     second = provider.get_tool_schemas()
 
-    assert len(first) == 10
+    assert len(first) == 11
     assert first == second
     # A fresh copy each call: mutating one result must not leak into the next.
     first[0]["name"] = "mutated"
@@ -871,7 +871,7 @@ def test_get_tool_schemas_makes_no_request(fake_engram: FakeEngram) -> None:
     provider = RecallProvider(config=make_config(fake_engram.base_url))
 
     for _ in range(3):
-        assert len(provider.get_tool_schemas()) == 10
+        assert len(provider.get_tool_schemas()) == 11
 
     assert fake_engram.requests == []
 

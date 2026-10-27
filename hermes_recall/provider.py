@@ -1303,7 +1303,7 @@ class RecallProvider(MemoryProvider):
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        """Return the ten ``mem_*`` schemas, or ``[]`` when recall is disabled.
+        """Return the ``mem_*`` schemas, or ``[]`` when recall is disabled.
 
         Cheap, pure and side-effect free: the host calls it at least three times
         during registration alone (conflict check, routing table, log line).

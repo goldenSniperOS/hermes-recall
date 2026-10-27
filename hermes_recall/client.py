@@ -51,6 +51,9 @@ _UPDATABLE_FIELDS = ("type", "title", "content", "find", "replace", "project", "
 # The only `match_mode` values the server accepts; anything else is a 400.
 _MATCH_MODES = frozenset({"all", "any"})
 
+# Bounds `POST /conflicts/judge-many` enforces on its batch (agentops.JudgmentBatch).
+JUDGE_MANY_MAX = 32
+
 
 class EngramClient:
     """Thin, fail-soft HTTP client for one Engram server."""
@@ -110,16 +113,31 @@ class EngramClient:
         """
         return getattr(self._errors, "status", None)
 
+    @property
+    def last_error_body(self) -> dict[str, Any] | None:
+        """The JSON object of the last HTTP error answer on this thread, if it had one.
+
+        Engram 3.6 refusals carry a machine-readable ``code`` and context (for example
+        ``available_projects``, or a consolidation's fresh ``plan``) next to ``error``.
+        ``None`` after a success, after a failure no server answered, and when the
+        error body was not a JSON object (an older server's unknown route answers a
+        plain-text 404).
+        """
+        return getattr(self._errors, "body", None)
+
     # -- Transport -----------------------------------------------------------
 
-    def _record_error(self, message: str, status: int | None = None) -> None:
-        """Store a failure reason (and its HTTP status, if any) and log it at debug only.
+    def _record_error(
+        self, message: str, status: int | None = None, body: dict[str, Any] | None = None
+    ) -> None:
+        """Store a failure reason (and its HTTP status and body, if any); log at debug only.
 
         Never above debug: the provider is fail-soft, and an Engram server that
         is simply not running would otherwise print a warning on every turn.
         """
         self._errors.message = message
         self._errors.status = status
+        self._errors.body = body
         logger.debug("engram client: %s", message)
 
     def _request(
@@ -169,6 +187,7 @@ class EngramClient:
                 raw = response.read()
             self._errors.message = ""
             self._errors.status = None
+            self._errors.body = None
             if not raw:
                 return None
             try:
@@ -181,8 +200,9 @@ class EngramClient:
         except urllib.error.HTTPError as exc:
             # Never include the request body in the recorded reason: it carries
             # user content (observation text, prompts, search queries).
-            detail = _http_error_detail(exc)
-            self._record_error(f"{method} {path}: HTTP {exc.code}{detail}", exc.code)
+            payload = _http_error_payload(exc)
+            detail = _http_error_detail(exc, payload)
+            self._record_error(f"{method} {path}: HTTP {exc.code}{detail}", exc.code, payload)
             return None
         except urllib.error.URLError as exc:
             self._record_error(f"{method} {path}: unreachable ({exc.reason})")
@@ -359,9 +379,28 @@ class EngramClient:
             )
         )
 
-    def get_observation(self, observation_id: int) -> dict[str, Any] | None:
-        """``GET /observations/{id}`` → the observation, or ``None`` when missing."""
-        return _as_dict(self._request("GET", f"/observations/{observation_id}"))
+    def get_observation(
+        self,
+        observation_id: int,
+        *,
+        include_history: bool = False,
+        history_cursor: int | None = None,
+    ) -> dict[str, Any] | None:
+        """``GET /observations/{id}`` → the observation, or ``None`` when missing.
+
+        With ``include_history`` (Engram 3.6) the row also carries ``history`` (at most
+        50 prior snapshots), ``version_count`` and, when older pages remain,
+        ``history_truncated`` / ``history_from_version`` / ``history_cursor``.
+        ``history_cursor`` is only sent with the flag, the only case the server reads
+        it; without the flag the request carries no query at all. An older server
+        ignores both and answers the plain row.
+        """
+        params: dict[str, Any] = {}
+        if include_history:
+            params["include_history"] = True
+            if history_cursor is not None:
+                params["history_cursor"] = history_cursor
+        return _as_dict(self._request("GET", f"/observations/{observation_id}", params=params))
 
     def recent_observations(
         self, project: str = "", limit: int = 20, scope: str = ""
@@ -509,6 +548,26 @@ class EngramClient:
             body["confidence"] = confidence
         return _as_dict(self._request("POST", "/conflicts/judge", body=body))
 
+    def judge_many(
+        self, judgments: list[dict[str, Any]], session_id: str = ""
+    ) -> dict[str, Any] | None:
+        """``POST /conflicts/judge-many`` → ``{"outcomes": [...]}``, one per judgment.
+
+        Engram 3.6. The batch is 1..32 items; each item is applied (or refused) on its
+        own, so a 200 can carry per-item errors. ``session_id`` replaces every item's
+        provenance server-side; a blank one is omitted.
+        """
+        if not isinstance(judgments, list) or not 1 <= len(judgments) <= JUDGE_MANY_MAX:
+            self._record_error(
+                f"POST /conflicts/judge-many: refused locally, batch must hold "
+                f"1..{JUDGE_MANY_MAX} judgments"
+            )
+            return None
+        body: dict[str, Any] = {"judgments": judgments}
+        if session_id.strip():
+            body["session_id"] = session_id
+        return _as_dict(self._request("POST", "/conflicts/judge-many", body=body))
+
     def pin_observation(self, observation_id: int) -> dict[str, Any] | None:
         """``PUT /observations/{id}/pin`` → ``{"id", "pinned": true}``."""
         return _as_dict(self._request("PUT", f"/observations/{observation_id}/pin"))
@@ -565,12 +624,17 @@ def _query_value(value: Any) -> str:
     return str(value)
 
 
-def _http_error_detail(exc: urllib.error.HTTPError) -> str:
-    """Extract the server's ``error`` field from an HTTPError body, if present."""
+def _http_error_payload(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
+    """The HTTPError body as a JSON object, or ``None`` when it is not one."""
     try:
         payload = json.loads(exc.read().decode("utf-8"))
     except Exception:
-        return f" {exc.reason}" if exc.reason else ""
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _http_error_detail(exc: urllib.error.HTTPError, payload: dict[str, Any] | None) -> str:
+    """The server's ``error`` field from the decoded body, else the HTTP reason."""
     if isinstance(payload, dict):
         message = payload.get("error")
         if isinstance(message, str) and message:

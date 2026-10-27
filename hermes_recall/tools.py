@@ -1,8 +1,8 @@
 """The compact ``mem_*`` tool schemas and their handlers, replacing the Engram MCP surface.
 
-Ten tools, each a thin mapping onto one Engram HTTP route. Descriptions are kept
+Each tool is a thin mapping onto one Engram HTTP route. Descriptions are kept
 short on purpose: every schema is sent on every API call, and the whole point of
-this provider over the Engram MCP server is that the model pays for ten compact
+this provider over the Engram MCP server is that the model pays for a few compact
 schemas instead of ~19 verbose ones.
 
 Contract of :func:`handle_tool_call`: it **always** returns a JSON string and never
@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .client import EngramClient
+from .client import JUDGE_MANY_MAX, EngramClient
 from .format import (
     observation_status,
     pinned_status,
@@ -44,6 +44,9 @@ SEARCH_LIMIT_MAX = 20
 SEARCH_SNIPPET_MAX_CHARS = 300
 # Full observation body in a mem_get_observation result.
 OBSERVATION_CONTENT_MAX_CHARS = 12000
+# Per-version content in a mem_get_observation history page. A page holds up to 50
+# prior snapshots, so each one is a preview; the current body is the full one.
+HISTORY_CONTENT_MAX_CHARS = 1000
 CONTEXT_MAX_CHARS = 6000
 TIMELINE_WINDOW_MAX = 20
 QUERY_MAX_CHARS = 500
@@ -66,6 +69,16 @@ JUDGMENT_KEYS = ("judgment_required", "judgment_id", "candidates", "conflicts")
 
 # Engram's error text for a write naming a session it has no row for.
 SESSION_NOT_FOUND = "session not found"
+
+# First Engram release with the agent-workflow routes (judge-many, consolidate,
+# finalize) and observation history. No /health flag announces them, so an older
+# server is recognised by how it answers an unknown route.
+WORKFLOW_MIN_ENGRAM = "3.5.1"
+
+# Keys of an Engram refusal body worth handing to the model next to the reason: the
+# machine-readable code and what it needs to choose again (server.go
+# writeProjectResolutionError).
+_REFUSAL_FIELDS = ("code", "available_projects", "candidate_project", "remedy")
 
 # -- Schemas ------------------------------------------------------------------
 
@@ -135,7 +148,16 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         },
         ["id", "expected_project"],
     ),
-    _schema("mem_get_observation", "Get one observation in full.", {"id": _ID}, ["id"]),
+    _schema(
+        "mem_get_observation",
+        "Get one observation in full, optionally with its version history.",
+        {
+            "id": _ID,
+            "include_history": {"type": "boolean", "description": "Add prior versions"},
+            "history_cursor": _i("history_cursor of the previous page"),
+        },
+        ["id"],
+    ),
     _schema(
         "mem_context",
         "Recent project context from Engram (sessions and observations).",
@@ -173,16 +195,47 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     ),
     _schema("mem_pin", "Pin an observation so recall favors it.", {"id": _ID}, ["id"]),
     _schema("mem_unpin", "Unpin an observation.", {"id": _ID}, ["id"]),
+    _schema(
+        "mem_judge_many",
+        "Resolve up to 32 conflict candidates at once; never retried.",
+        {
+            "judgments": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": JUDGE_MANY_MAX,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "judgment_id": {"type": "string"},
+                        "relation": {"type": "string", "enum": list(JUDGE_RELATIONS)},
+                        "reason": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["judgment_id", "relation"],
+                },
+            }
+        },
+        ["judgments"],
+    ),
 )
 
 TOOL_NAMES: frozenset[str] = frozenset(schema["name"] for schema in _TOOL_SCHEMAS)
 WRITE_TOOLS: frozenset[str] = frozenset(
-    {"mem_save", "mem_update", "mem_session_summary", "mem_judge", "mem_pin", "mem_unpin"}
+    {
+        "mem_save",
+        "mem_update",
+        "mem_session_summary",
+        "mem_judge",
+        "mem_pin",
+        "mem_unpin",
+        "mem_judge_many",
+    }
 )
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
-    """Return a fresh copy of the ten schemas. Pure, cheap, no I/O.
+    """Return a fresh copy of the schemas. Pure, cheap, no I/O.
 
     A copy, because the host may normalise or annotate what it is handed, and the
     module constant must stay byte-stable across calls.
@@ -218,7 +271,16 @@ class ToolEnv:
 
 
 class ToolError(Exception):
-    """A user-facing tool failure; its message becomes the JSON ``error``."""
+    """A user-facing tool failure; its message becomes the JSON ``error``.
+
+    ``fields`` are extra keys of the JSON error result (an Engram refusal's ``code``,
+    a consolidation's fresh ``plan``), so the model can act on them without parsing
+    the message.
+    """
+
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.fields = fields
 
 
 # -- Dispatch -------------------------------------------------------------------
@@ -247,7 +309,7 @@ def handle_tool_call(env: ToolEnv, tool_name: str, args: Any) -> str:
         handler = _HANDLERS[tool_name]
         return _dump(handler(env, args))
     except ToolError as exc:
-        return error_result(str(exc))
+        return _dump({"error": str(exc), **exc.fields})
     except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
         logger.debug("recall tool %s failed", tool_name, exc_info=True)
         return error_result(f"{tool_name} failed: {type(exc).__name__}")
@@ -262,8 +324,47 @@ def error_result(message: str) -> str:
 
 
 def _engram_error(env: ToolEnv, action: str) -> ToolError:
-    reason = env.client.last_error_text() or "no response"
+    """The tool error for a failed Engram call, worded by whether a server answered.
+
+    An HTTP answer (404 ``unknown_project``, 409 ``ambiguous_project``, a 500) is not
+    an outage: asking the model whether `engram serve` is running would send it the
+    wrong way, so the server's reason and code are reported instead. The hint stays
+    for the cases where no server answered.
+    """
+    client = env.client
+    reason = client.last_error_text() or "no response"
+    if client.last_error_status is not None:
+        return ToolError(f"Engram refused the {action}: {reason}", **_refusal_fields(client))
     return ToolError(f"Engram {action} failed: {reason}. Is `engram serve` running?")
+
+
+def _refusal_fields(client: Any) -> dict[str, Any]:
+    """The actionable keys of the last refusal body (:data:`_REFUSAL_FIELDS`)."""
+    body = getattr(client, "last_error_body", None)
+    if not isinstance(body, dict):
+        return {}
+    return {key: body[key] for key in _REFUSAL_FIELDS if body.get(key) not in (None, "", [])}
+
+
+def _route_missing(client: Any) -> bool:
+    """Whether the last failure was a server without the route (Engram < 3.5.1).
+
+    Go's ServeMux answers an unknown path with a plain-text 404 and a known path
+    with the wrong method with 405. A JSON 404 is a real refusal from a server that
+    has the route (``unknown_session``), never "too old".
+    """
+    status = client.last_error_status
+    return status == 405 or (status == 404 and getattr(client, "last_error_body", None) is None)
+
+
+def _workflow_error(env: ToolEnv, tool_name: str, action: str) -> ToolError:
+    """The tool error for a failed agent-workflow call (judge-many, consolidate, finalize)."""
+    if _route_missing(env.client):
+        return ToolError(
+            f"{tool_name} needs Engram >= {WORKFLOW_MIN_ENGRAM}; this server does not "
+            f"have the route ({env.client.last_error_text()})."
+        )
+    return _engram_error(env, action)
 
 
 # -- Argument parsing -----------------------------------------------------------
@@ -538,19 +639,75 @@ def _mem_update(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cursor_arg(args: dict[str, Any]) -> int | None:
+    """``history_cursor``: ``None`` when absent, else a non-negative integer."""
+    value = args.get("history_cursor")
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ToolError("'history_cursor' must be a non-negative integer from a previous page")
+    return value
+
+
+# History keys of a ``?include_history=true`` answer, lifted out of the observation.
+_HISTORY_KEYS = ("history", "version_count", "history_truncated", "history_from_version")
+
+
+def _history_page(body: dict[str, Any]) -> dict[str, Any]:
+    """Pop the history keys off ``body`` into a page, capping each version's content."""
+    page: dict[str, Any] = {key: body.pop(key) for key in _HISTORY_KEYS if key in body}
+    versions = []
+    for version in page.get("history") or []:
+        entry = dict(version) if isinstance(version, dict) else {"value": version}
+        content = entry.get("content")
+        if isinstance(content, str) and len(content) > HISTORY_CONTENT_MAX_CHARS:
+            entry["content"] = truncate(content, HISTORY_CONTENT_MAX_CHARS)
+            entry["content_truncated"] = True
+        versions.append(entry)
+    page["history"] = versions
+    page["history_truncated"] = page.get("history_truncated") is True
+    # The next page's cursor, only while older pages remain.
+    cursor = body.pop("history_cursor", None)
+    if page["history_truncated"] and cursor is not None:
+        page["history_cursor"] = cursor
+    return page
+
+
 def _mem_get_observation(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
     observation_id = _id_arg(args, "id")
-    observation = env.client.get_observation(observation_id)
+    include_history = _bool_arg(args, "include_history")
+    cursor = _cursor_arg(args) if include_history else None
+    observation = env.client.get_observation(
+        observation_id, include_history=include_history, history_cursor=cursor
+    )
     if observation is None:
         raise _engram_error(env, f"get #{observation_id}")
     body = dict(observation)
+    page: dict[str, Any] = {}
+    if include_history:
+        if "history" in body:
+            page = _history_page(body)
+        else:
+            page = {
+                "history_note": "This Engram returned no history; observation history "
+                f"needs Engram >= {WORKFLOW_MIN_ENGRAM}."
+            }
     content = body.get("content")
     if isinstance(content, str) and len(content) > OBSERVATION_CONTENT_MAX_CHARS:
         body["content"] = truncate(content, OBSERVATION_CONTENT_MAX_CHARS)
         body["content_truncated"] = True
     project = body.get("project") if isinstance(body.get("project"), str) else ""
     _remember(env, observation_id, "observation", project)
-    return {"id": observation_id, "status": observation_status(observation_id), "observation": body}
+    return {
+        "id": observation_id,
+        "status": observation_status(observation_id),
+        "observation": body,
+        **page,
+    }
 
 
 def _mem_context(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
@@ -575,29 +732,69 @@ def _mem_timeline(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
     return timeline
 
 
-def _mem_judge(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
+def _judgment(args: dict[str, Any]) -> dict[str, Any]:
+    """Validate one judgment and return its wire fields; blank optionals are dropped."""
     judgment_id = _str_arg(args, "judgment_id", required=True)
     relation = _str_arg(args, "relation", required=True)
     if relation not in JUDGE_RELATIONS:
         raise ToolError(f"'relation' must be one of: {', '.join(JUDGE_RELATIONS)}")
+    judgment: dict[str, Any] = {"judgment_id": judgment_id, "relation": relation}
+    for key in ("reason", "evidence"):
+        value = _str_arg(args, key)
+        if value:
+            judgment[key] = value
     confidence = args.get("confidence")
     if confidence is not None:
         if isinstance(confidence, bool) or not isinstance(confidence, int | float):
             raise ToolError("'confidence' must be a number between 0.0 and 1.0")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ToolError("'confidence' must be between 0.0 and 1.0")
-        confidence = float(confidence)
+        judgment["confidence"] = float(confidence)
+    return judgment
+
+
+def _mem_judge(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
+    judgment = _judgment(args)
     judged = env.client.judge_conflict(
-        judgment_id,
-        relation,
-        reason=_str_arg(args, "reason"),
-        evidence=_str_arg(args, "evidence"),
-        confidence=confidence,
+        judgment["judgment_id"],
+        judgment["relation"],
+        reason=judgment.get("reason", ""),
+        evidence=judgment.get("evidence", ""),
+        confidence=judgment.get("confidence"),
         session_id=env.write_session_id(),
     )
     if judged is None:
         raise _engram_error(env, "judge")
-    return {**judged, "status": f"🧠 judged {judgment_id}: {relation}"}
+    return {**judged, "status": f"🧠 judged {judgment['judgment_id']}: {judgment['relation']}"}
+
+
+def _mem_judge_many(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
+    """POST /conflicts/judge-many. Every item is validated before anything is sent.
+
+    Never replayed: a batch applies item by item server-side, so after a failed or
+    uncertain answer some verdicts may already be recorded.
+    """
+    raw = args.get("judgments")
+    if not isinstance(raw, list):
+        raise ToolError("'judgments' must be a list of {judgment_id, relation} objects")
+    if not 1 <= len(raw) <= JUDGE_MANY_MAX:
+        raise ToolError(f"'judgments' must hold 1..{JUDGE_MANY_MAX} items")
+    judgments = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ToolError(f"judgments[{index}] must be an object")
+        try:
+            judgments.append(_judgment(item))
+        except ToolError as exc:
+            raise ToolError(f"judgments[{index}]: {exc}") from None
+    judged = env.client.judge_many(judgments, session_id=env.write_session_id())
+    if judged is None:
+        raise _workflow_error(env, "mem_judge_many", "judge-many")
+    outcomes = judged.get("outcomes") if isinstance(judged.get("outcomes"), list) else []
+    succeeded = sum(1 for o in outcomes if isinstance(o, dict) and o.get("status") == "success")
+    failed = len(outcomes) - succeeded
+    status = f"🧠 judged {succeeded} of {len(judgments)}"
+    return {**judged, "status": f"{status} ({failed} failed)" if failed else status}
 
 
 def _pin_handler(pinned: bool) -> Callable[[ToolEnv, dict[str, Any]], dict[str, Any]]:
@@ -625,6 +822,7 @@ _HANDLERS: dict[str, Callable[[ToolEnv, dict[str, Any]], Any]] = {
     "mem_judge": _mem_judge,
     "mem_pin": _pin_handler(True),
     "mem_unpin": _pin_handler(False),
+    "mem_judge_many": _mem_judge_many,
 }
 
 # -- Human status (``/recall`` and ``hermes recall status``) ---------------------

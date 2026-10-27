@@ -576,6 +576,36 @@ def test_get_observation_returns_none_on_404(fake_engram: FakeEngram) -> None:
     assert "observation not found" in client.last_error_text()
 
 
+def test_get_observation_without_history_sends_no_query(fake_engram: FakeEngram) -> None:
+    fake_engram.route("GET", "/observations/761", (200, {"id": 761}))
+
+    client_for(fake_engram).get_observation(761)
+
+    request = fake_engram.find("GET", "/observations/761")
+    assert request is not None
+    assert request.query == {}
+
+
+def test_get_observation_with_history_sends_the_flag_and_cursor(fake_engram: FakeEngram) -> None:
+    # Engram 3.6 (server.go handleGetObservation): only the literal "true" opts in.
+    page = {"id": 761, "history": [], "version_count": 0}
+    fake_engram.route("GET", "/observations/761", (200, page))
+    client = client_for(fake_engram)
+
+    assert client.get_observation(761, include_history=True, history_cursor=50) == page
+    assert fake_engram.requests[-1].query == {"include_history": ["true"], "history_cursor": ["50"]}
+
+    client.get_observation(761, include_history=True, history_cursor=0)
+    assert fake_engram.requests[-1].query == {"include_history": ["true"], "history_cursor": ["0"]}
+
+    client.get_observation(761, include_history=True)
+    assert fake_engram.requests[-1].query == {"include_history": ["true"]}
+
+    # A cursor without the flag is ignored, as the server would ignore it.
+    client.get_observation(761, history_cursor=50)
+    assert fake_engram.requests[-1].query == {}
+
+
 def test_add_prompt_posts_session_and_content(fake_engram: FakeEngram) -> None:
     fake_engram.route("POST", "/prompts", (201, {"id": 12, "status": "saved"}))
 
@@ -647,6 +677,44 @@ def test_stats_sends_project_or_all_projects_but_never_both(fake_engram: FakeEng
     assert "project" not in second.query
 
 
+# -- Engram 3.6 agent workflows ----------------------------------------------
+
+
+def test_judge_many_posts_the_batch_with_the_session(fake_engram: FakeEngram) -> None:
+    outcomes = {"outcomes": [{"index": 0, "judgment_id": "rel-1", "status": "success"}]}
+    fake_engram.route("POST", "/conflicts/judge-many", (200, outcomes))
+    judgments = [{"judgment_id": "rel-1", "relation": "related", "confidence": 0.5}]
+
+    result = client_for(fake_engram).judge_many(judgments, session_id="sess-1")
+
+    assert result == outcomes
+    request = fake_engram.find("POST", "/conflicts/judge-many")
+    assert request is not None
+    assert request.json_body == {"judgments": judgments, "session_id": "sess-1"}
+
+
+def test_judge_many_omits_a_blank_session(fake_engram: FakeEngram) -> None:
+    fake_engram.route("POST", "/conflicts/judge-many", (200, {"outcomes": []}))
+    judgments = [{"judgment_id": "rel-1", "relation": "related"}]
+
+    client_for(fake_engram).judge_many(judgments, session_id="  ")
+
+    assert fake_engram.requests[-1].json_body == {"judgments": judgments}
+
+
+@pytest.mark.parametrize("count", [0, 33])
+def test_judge_many_refuses_a_batch_outside_1_to_32_without_a_request(
+    fake_engram: FakeEngram, count: int
+) -> None:
+    client = client_for(fake_engram)
+    batch = [{"judgment_id": f"rel-{i}", "relation": "related"} for i in range(count)]
+
+    assert client.judge_many(batch) is None
+    assert "refused locally" in client.last_error_text()
+    assert client.last_error_status is None
+    assert fake_engram.requests == []
+
+
 # -- 12. fail-soft sweep ------------------------------------------------------
 
 # Every public endpoint method, with arguments good enough to reach the network.
@@ -670,6 +738,7 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
     "timeline": ((761,), {}),
     "stats": ((), {}),
     "judge_conflict": (("rel-1", "related"), {}),
+    "judge_many": (([{"judgment_id": "rel-1", "relation": "related"}],), {}),
     "pin_observation": ((761,), {}),
     "unpin_observation": ((761,), {}),
 }
@@ -903,6 +972,34 @@ def test_last_error_status_is_none_when_no_server_answered(fake_engram: FakeEngr
     assert refused.health() is None
     assert refused.last_error_text() != ""
     assert refused.last_error_status is None
+
+
+def test_last_error_body_is_the_json_error_object_of_an_answer(fake_engram: FakeEngram) -> None:
+    # Engram 3.6 refusals carry a machine-readable code and context next to `error`.
+    refusal = {
+        "error": 'project "nope" not found',
+        "code": "unknown_project",
+        "available_projects": ["a", "b"],
+    }
+    fake_engram.route("GET", "/search", (404, refusal))
+    fake_engram.route("GET", "/health", (200, HEALTH_PAYLOAD))
+    fake_engram.route("GET", "/context", Malformed(404, b"404 page not found\n"))
+    client = client_for(fake_engram)
+    assert client.last_error_body is None
+
+    assert client.search("x", project="nope") == []
+    assert client.last_error_body == refusal
+    assert client.last_error_status == 404
+    assert 'HTTP 404 project "nope" not found' in client.last_error_text()
+
+    # A success clears it, like the reason and the status.
+    assert client.health() == HEALTH_PAYLOAD
+    assert client.last_error_body is None
+
+    # A non-JSON error body (an older server's unknown route) leaves no body.
+    assert client.context(project="p") == ""
+    assert client.last_error_status == 404
+    assert client.last_error_body is None
 
 
 def test_last_error_status_is_none_after_a_timeout(

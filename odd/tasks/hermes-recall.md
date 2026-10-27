@@ -83,6 +83,101 @@ prompt request. Hermes ships a native `MemoryProvider` ABC for exactly this.
 - [x] T8 (owned by the hermes-odd session) hermes-odd v0.7.0: doctor detects provider, status shows last memory id,
       install prompt covers hermes-recall, memory pointer adapts. Route: delegated.
 
+## v0.4.0 — Engram 3.1-3.6 / gentle-engram 0.5 additions
+
+Target: Engram 3.6.0 (installed via brew 2026-10-27; DB backup
+`~/.engram-backups/engram-2026-10-27-pre-3.6.db`). Contract mapped from
+`.refs/engram-src` at v3.6.0 (98912f8). v0.3.0 already passes a full smoke on 3.6.0.
+New routes have no `/health` capability flag: an older server's 404/405 must turn into
+a clear "needs Engram >= 3.5.1" tool error, never a crash.
+
+### Specs
+
+- S1 Compact search: `mem_search` and the prefetch `/search` send
+  `response_format=compact`; the client accepts both the compact object
+  `{result, results:[{id, title, type, preview, truncated, pinned, state, ...}]}` and
+  the legacy bare array (older servers ignore the param). Hits render from `preview`
+  when there is no `content`; `pinned` is surfaced in tool hits.
+- S2 History: `mem_get_observation{id, include_history?, history_cursor?}` forwards
+  `include_history=true` and `history_cursor`; returns `history`, `version_count`,
+  `history_truncated`, `history_cursor` (next page); each history entry's content is
+  capped. Without `include_history` the request is unchanged.
+- S3 `mem_consolidate{ids_to_delete[>=2 distinct positive ints], new_title,
+  new_content, expected_project, type?, topic_key?, confirm?, fingerprint?}` → POST
+  `/observations/consolidate`. Preview (no confirm) returns the plan and tells the
+  model to show it to the user and confirm with the plan's fingerprint. A 409
+  `fingerprint_mismatch` returns the fresh plan and is never auto-confirmed; no
+  retry after a 500 or timeout. Write tool (primary context only); private tags
+  redacted from title/content; survivor id remembered.
+- S4 `mem_judge_many{judgments[1..32]{judgment_id, relation, reason?, evidence?,
+  confidence?}}` → POST `/conflicts/judge-many` with the effective session id;
+  per-item validation like `mem_judge`; outcomes returned; never replayed.
+- S5 `mem_session_finalize{summary, project?}` → POST `/sessions/{effective id}/finalize`
+  `{project, summary}` (registers the session first, like saves). Success (incl.
+  `already_finalized`) marks the session ended so the shutdown/switch `/end` is not
+  posted, and a later write registers a resume continuation. Uncertain result: no
+  retry, no fallback to `/end`. Refusals (403/404/409) are reported with Engram's code.
+- S6 Capture provenance: `project_provenance {source, directory}` on POST `/sessions`,
+  `/observations`, `/observations/passive`, `/prompts`. `source` is the detected
+  `project_source` when the detected project is the write's project and the value is
+  in Engram's allowed set, `config` for `memory.recall.project`, else `unknown`.
+  Never sent on `/finalize` (strict body). `/project/current` has no `directory` param
+  in 3.6.0 (`cwd` is canonical, already used): not applicable.
+- S7 Protocol: the static system prompt adds the canonical topic workflow (search
+  first, read in full, same topic → `mem_update` by id with `expected_project`,
+  new topic → `mem_save` with a distinct `topic_key`, never merge across projects),
+  the empty-scoped-search retry (`match_mode:any` + `all_projects`), and the new
+  tools. Compaction recovery already travels outside the system prompt
+  (`on_pre_compress` return value): documented, no change.
+- S8 Server refusals are not outages: a read tool that got an HTTP answer (e.g. 404
+  `unknown_project` with `available_projects`, 409 `ambiguous_project`) reports
+  Engram's reason instead of "Is `engram serve` running?".
+
+### Tasks
+
+- [x] T12 S2+S4+S8 client error bodies, history, judge-many, refusal wording. Route: inline.
+- [ ] T13 S3 mem_consolidate. Route: inline.
+- [ ] T14 S5 mem_session_finalize + end suppression. Route: inline.
+- [ ] T15 S1 compact search (tool + prefetch). Route: inline.
+- [ ] T16 S6 capture provenance. Route: inline (own commit; writes data).
+- [ ] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
+- [ ] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
+      v0.4.0, restart live Engram on 3.6.0, live `hermes plugins update recall`.
+
+Route note: all units share `client.py`/`tools.py`, so they are not independent
+writers; done inline, test-first, in ~400-line commits.
+
+### Log
+
+- L1 (2026-10-27, owner): "Arranquemos y hagamos todo." — answer to the proposed
+  list: compact search, observation history, atomic consolidation, batch judgments +
+  atomic session finalization, capture provenance + explicit directory/cwd, protocol
+  alignment (canonical topics, compaction recovery outside the system prompt), after
+  upgrading Engram to 3.6.
+- L2 Evidence: Engram 3.6.0 refuses cloud autosync to the owner's
+  `http://192.168.68.198:18080` (bearer token requires HTTPS); same check exists in
+  3.4.0, so it was already off. Out of scope; reported to the owner.
+- L3 Decision: the schema payload is 4339 bytes before v0.4.0; three new tools
+  (`mem_consolidate`, `mem_judge_many`, `mem_session_finalize`) bring the tool count to
+  13. Raise the compactness cap in `test_total_schema_payload_stays_compact` to 5600
+  bytes, keep every description <= 80 chars, and assert the new names in order after
+  `mem_unpin`.
+- L4 Route: parent context hit the 150k backstop; T12-T17 delegated to one
+  gentle-ai-worker (sequential, shared files). T18 stays with the parent.
+- L5 Decisions (T12, worker): S8 applies to every tool through `_engram_error`, not
+  only reads: any HTTP answer is reported as `Engram refused the <action>: <reason>`
+  with Engram's `code` plus `available_projects` / `candidate_project` / `remedy`
+  when sent; the `engram serve` hint stays only when no server answered. "Route
+  missing" = 405, or 404 whose body is not a JSON object (Go ServeMux); a JSON 404 is
+  a real refusal. History: each version's content is capped at 1000 chars
+  (`HISTORY_CONTENT_MAX_CHARS`, 50 versions per page); `history_cursor` is only
+  validated and sent with `include_history` (the server ignores it otherwise); an
+  Engram that answers without `history` gets a `history_note` naming >= 3.5.1.
+  `mem_judge_many` validates every item locally (like `mem_judge`) and refuses the
+  whole batch, naming the index, before sending anything. The T12 commit exceeds
+  ~400 lines (about half are tests) because S2+S4+S8 share the client error-body
+  change.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows

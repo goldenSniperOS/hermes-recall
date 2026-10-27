@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_engram import FakeEngram, RecordedRequest
+from fake_engram import FakeEngram, Malformed, RecordedRequest
 
 from hermes_recall import tools as tools_module
 from hermes_recall.config import RecallConfig
@@ -34,6 +34,7 @@ EXPECTED_TOOLS = [
     "mem_judge",
     "mem_pin",
     "mem_unpin",
+    "mem_judge_many",
 ]
 
 OBSERVATION = {
@@ -128,7 +129,7 @@ def only(fake: FakeEngram, method: str, path: str) -> RecordedRequest:
 # -- schemas ------------------------------------------------------------------
 
 
-def test_exactly_ten_schemas_with_the_expected_names() -> None:
+def test_schemas_have_the_expected_names_in_order() -> None:
     schemas = tools_module.get_tool_schemas()
     assert [s["name"] for s in schemas] == EXPECTED_TOOLS
     assert tools_module.TOOL_NAMES == frozenset(EXPECTED_TOOLS)
@@ -145,7 +146,8 @@ def test_schemas_are_bare_function_schemas_with_short_descriptions() -> None:
 
 def test_total_schema_payload_stays_compact() -> None:
     # Token cost is the reason this tool set exists; keep it honest.
-    assert len(json.dumps(tools_module.get_tool_schemas())) < 4500
+    # L3: raised from 4500 for the three Engram 3.6 workflow tools.
+    assert len(json.dumps(tools_module.get_tool_schemas())) < 5600
 
 
 def test_write_tools_are_a_subset_of_the_tools() -> None:
@@ -566,6 +568,107 @@ def test_mem_get_observation_result_status_and_state(
     assert state["project"] == PROJECT
 
 
+def test_mem_get_observation_without_history_sends_no_history_params(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_get_observation", id=761)
+
+    assert only(fake_engram, "GET", "/observations/761").query == {}
+    assert set(result) == {"id", "status", "observation"}
+
+
+HISTORY_PAGE = {
+    **OBSERVATION,
+    "history": [
+        {"version": 2, "title": "Old", "content": "z" * 5000, "created_at": "2026-01-01"},
+        {"version": 3, "title": "Older", "content": "short", "created_at": "2026-01-02"},
+    ],
+    "version_count": 60,
+    "history_truncated": True,
+    "history_from_version": 2,
+    "history_cursor": 50,
+}
+
+
+def test_mem_get_observation_with_history_forwards_and_returns_the_page(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("GET", "/observations/761", (200, HISTORY_PAGE))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_get_observation", id=761, include_history=True, history_cursor=50)
+
+    request = only(fake_engram, "GET", "/observations/761")
+    assert request.query == {"include_history": ["true"], "history_cursor": ["50"]}
+    assert result["observation"] == OBSERVATION
+    assert result["version_count"] == 60
+    assert result["history_truncated"] is True
+    assert result["history_from_version"] == 2
+    assert result["history_cursor"] == 50
+    first, second = result["history"]
+    assert first["version"] == 2
+    assert first["content_truncated"] is True
+    assert len(first["content"]) <= tools_module.HISTORY_CONTENT_MAX_CHARS + 3
+    assert second == HISTORY_PAGE["history"][1]
+    state = read_state(tmp_path)
+    assert (state["last_memory_id"], state["last_action"]) == (761, "observation")
+
+
+def test_mem_get_observation_last_history_page_has_no_cursor(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    last_page = {**OBSERVATION, "history": [], "version_count": 1}
+    fake_engram.route("GET", "/observations/761", (200, last_page))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_get_observation", id=761, include_history=True)
+
+    assert only(fake_engram, "GET", "/observations/761").query == {"include_history": ["true"]}
+    assert result["history"] == []
+    assert result["version_count"] == 1
+    assert result["history_truncated"] is False
+    assert "history_cursor" not in result
+
+
+def test_mem_get_observation_history_on_an_older_engram_says_so(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    # An Engram without history ignores the flag and answers the plain row.
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+
+    result = call(provider, "mem_get_observation", id=761, include_history=True)
+
+    assert result["observation"] == OBSERVATION
+    assert "history" not in result
+    assert "Engram >= 3.5.1" in result["history_note"]
+
+
+@pytest.mark.parametrize("cursor", [-1, "x", 1.5, True])
+def test_mem_get_observation_refuses_a_bad_history_cursor_without_a_request(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path, cursor: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    error = call(
+        provider, "mem_get_observation", id=761, include_history=True, history_cursor=cursor
+    )["error"]
+
+    assert "history_cursor" in error
+    assert fake_engram.requests == []
+    assert not state_path(tmp_path).exists()
+
+
 def test_mem_get_observation_caps_huge_content(fake_engram: FakeEngram, make_provider: Any) -> None:
     wire(fake_engram)
     fake_engram.route("GET", "/observations/761", (200, {**OBSERVATION, "content": "y" * 50000}))
@@ -664,6 +767,172 @@ def test_mem_judge_validates_relation_and_confidence(
     assert fake_engram.requests == []
 
 
+# -- mem_judge_many -----------------------------------------------------------
+
+JUDGE_MANY_OUTCOMES = {
+    "outcomes": [
+        {
+            "index": 0,
+            "judgment_id": "rel-1",
+            "status": "success",
+            "relation": {"judgment_id": "rel-1", "relation": "supersedes"},
+            "judgment_status": "judged",
+        },
+        {
+            "index": 1,
+            "judgment_id": "rel-2",
+            "status": "error",
+            "error": 'JudgeRelation: relation "rel-2" not found',
+        },
+    ]
+}
+
+
+def test_mem_judge_many_request_and_result(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/conflicts/judge-many", (200, JUDGE_MANY_OUTCOMES))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(
+        provider,
+        "mem_judge_many",
+        judgments=[
+            {"judgment_id": "rel-1", "relation": "supersedes", "reason": "newer", "confidence": 1},
+            {"judgment_id": " rel-2 ", "relation": "related", "evidence": "same file"},
+        ],
+    )
+
+    assert only(fake_engram, "POST", "/conflicts/judge-many").json_body == {
+        "judgments": [
+            {
+                "judgment_id": "rel-1",
+                "relation": "supersedes",
+                "reason": "newer",
+                "confidence": 1.0,
+            },
+            {"judgment_id": "rel-2", "relation": "related", "evidence": "same file"},
+        ],
+        "session_id": SESSION,
+    }
+    assert [(r.method, r.path) for r in fake_engram.requests] == [("POST", "/conflicts/judge-many")]
+    assert result["outcomes"] == JUDGE_MANY_OUTCOMES["outcomes"]
+    assert result["status"] == "🧠 judged 1 of 2 (1 failed)"
+    assert not state_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("judgments", "message"),
+    [
+        (None, "'judgments'"),
+        ([], "1..32"),
+        ([{"judgment_id": f"r{i}", "relation": "related"} for i in range(33)], "1..32"),
+        ("rel-1", "'judgments'"),
+        (["rel-1"], "judgments[0]"),
+        ([{"judgment_id": "r", "relation": "related"}, {"relation": "related"}], "judgments[1]"),
+        ([{"judgment_id": "r", "relation": "maybe"}], "judgments[0]"),
+        ([{"judgment_id": "r", "relation": "related", "confidence": 2}], "judgments[0]"),
+        ([{"judgment_id": "r", "relation": "related", "reason": 5}], "judgments[0]"),
+    ],
+)
+def test_mem_judge_many_refuses_a_bad_batch_without_a_request(
+    fake_engram: FakeEngram, make_provider: Any, judgments: Any, message: str
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    args = {} if judgments is None else {"judgments": judgments}
+    error = call(provider, "mem_judge_many", **args)["error"]
+
+    assert message in error
+    assert fake_engram.requests == []
+
+
+def test_mem_judge_many_is_never_replayed_after_a_server_error(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/conflicts/judge-many", (500, {"error": "database is locked"}))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    error = call(
+        provider, "mem_judge_many", judgments=[{"judgment_id": "r", "relation": "related"}]
+    )["error"]
+
+    assert "database is locked" in error
+    assert "engram serve" not in error
+    assert [(r.method, r.path) for r in fake_engram.requests] == [("POST", "/conflicts/judge-many")]
+
+
+@pytest.mark.parametrize(
+    "older",
+    [Malformed(404, b"404 page not found\n"), Malformed(405, b"Method Not Allowed\n")],
+)
+def test_mem_judge_many_on_an_older_engram_needs_3_5_1(
+    fake_engram: FakeEngram, make_provider: Any, older: Malformed
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/conflicts/judge-many", older)
+    provider = make_provider(fake_engram.base_url)
+
+    error = call(
+        provider, "mem_judge_many", judgments=[{"judgment_id": "r", "relation": "related"}]
+    )["error"]
+
+    assert "mem_judge_many needs Engram >= 3.5.1" in error
+    assert "engram serve" not in error
+
+
+# -- server refusals are not outages (S8) --------------------------------------
+
+
+def test_a_read_refused_with_unknown_project_reports_engrams_reason(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    refusal = {
+        "error": 'project "nope" not found',
+        "code": "unknown_project",
+        "available_projects": ["hermes-recall", "engram"],
+    }
+    fake_engram.route("GET", "/search", (404, refusal))
+    provider = make_provider(fake_engram.base_url)
+
+    result = call(provider, "mem_search", query="x", project="nope")
+
+    assert result["error"] == (
+        'Engram refused the search: GET /search: HTTP 404 project "nope" not found'
+    )
+    assert result["code"] == "unknown_project"
+    assert result["available_projects"] == ["hermes-recall", "engram"]
+
+
+def test_a_read_refused_with_ambiguous_project_reports_engrams_reason(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    refusal = {
+        "error": "ambiguous project",
+        "code": "ambiguous_project",
+        "available_projects": ["a", "b"],
+        "project_source": "ambiguous",
+    }
+    fake_engram.route("GET", "/context", (409, refusal))
+    provider = make_provider(fake_engram.base_url)
+
+    result = call(provider, "mem_context")
+
+    assert result == {
+        "error": "Engram refused the context: GET /context: HTTP 409 ambiguous project",
+        "code": "ambiguous_project",
+        "available_projects": ["a", "b"],
+    }
+
+
 # -- mem_pin / mem_unpin ------------------------------------------------------
 
 
@@ -706,6 +975,7 @@ def test_mem_pin_missing_observation_is_an_error(
         ("mem_judge", {"judgment_id": "r", "relation": "related"}),
         ("mem_pin", {"id": 761}),
         ("mem_unpin", {"id": 761}),
+        ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
     ],
 )
 def test_non_primary_write_tools_are_refused(
@@ -752,6 +1022,7 @@ def test_non_primary_read_tools_still_work(fake_engram: FakeEngram, make_provide
         ("mem_judge", {"judgment_id": "r", "relation": "related"}),
         ("mem_pin", {"id": 761}),
         ("mem_unpin", {"id": 761}),
+        ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
     ],
 )
 def test_engram_down_is_a_json_error_never_a_raise(

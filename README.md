@@ -104,12 +104,13 @@ The model gets these tools (compact schemas, about 4 KB in total):
 | `mem_search` | `GET /search` |
 | `mem_save` | `POST /observations` |
 | `mem_update` | `PATCH /observations/{id}` |
-| `mem_get_observation` | `GET /observations/{id}` |
+| `mem_get_observation` | `GET /observations/{id}` (`include_history` adds prior versions) |
 | `mem_context` | `GET /context` |
 | `mem_session_summary` | `POST /observations` (type `session_summary`) |
 | `mem_timeline` | `GET /timeline` |
 | `mem_judge` | `POST /conflicts/judge` |
 | `mem_pin`, `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` |
+| `mem_judge_many` | `POST /conflicts/judge-many` (Engram >= 3.5.1) |
 
 Every write result carries a `status` such as `🧠 saved #761`, and the last
 memory id is kept in `<hermes_home>/recall/state.json`, so you can always get

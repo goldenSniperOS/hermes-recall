@@ -42,12 +42,13 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `mem_search` | `GET /search` | Default project = detected project |
 | `mem_save` | `POST /observations` | Registers the session and retries once on `session not found` |
 | `mem_update` | `PATCH /observations/{id}?expected_project=` | `expected_project` required, never defaulted; only given fields are sent |
-| `mem_get_observation` | `GET /observations/{id}` | |
+| `mem_get_observation` | `GET /observations/{id}` (`?include_history=true&history_cursor=`) | History keys lifted out of `observation`; each version's content capped; an Engram without history gets a `history_note` |
 | `mem_context` | `GET /context` | |
 | `mem_session_summary` | `POST /observations` (`type=session_summary`) | |
 | `mem_timeline` | `GET /timeline` | |
 | `mem_judge` | `POST /conflicts/judge` | `relation` ∈ related, compatible, scoped, conflicts_with, supersedes, not_conflict |
 | `mem_pin` / `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` | |
+| `mem_judge_many` | `POST /conflicts/judge-many` | 1..32 judgments, each validated like `mem_judge` before anything is sent; effective session id; never retried |
 | `/recall`, `hermes recall status` | `GET /health` | Plus `state.json` |
 | `/recall <id>`, `hermes recall show <id>` | `GET /observations/{id}` | |
 
@@ -55,6 +56,15 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 
 Every tool returns a JSON string and never raises. Failures are `{"error": "..."}`
 (unknown tool, bad arguments, writes refused, Engram unreachable or rejecting).
+
+An Engram that answered with an HTTP error is not an outage: the error reads
+`Engram refused the <action>: <reason>` and carries Engram's `code` and, when it
+sent them, `available_projects`, `candidate_project` or `remedy` (for example 404
+`unknown_project`, 409 `ambiguous_project`). Only when no server answered does the
+error end with "Is `engram serve` running?". The Engram 3.6 workflow tools
+(`mem_judge_many`, and later ones) have no `/health` capability flag; an older
+server answers their route with a plain-text 404 or a 405, which becomes
+`<tool> needs Engram >= 3.5.1`.
 
 Results that carry an observation id include a `status` field:
 
@@ -67,6 +77,7 @@ Results that carry an observation id include a `status` field:
 | `mem_pin` | `🧠 pinned #761` | `pinned` |
 | `mem_unpin` | `🧠 unpinned #761` | `unpinned` |
 | `mem_judge` | `🧠 judged <judgment_id>: <relation>` | — |
+| `mem_judge_many` | `🧠 judged 3 of 4 (1 failed)` | — |
 
 `mem_save` passes every key of Engram's response through (Engram's own `status`
 is renamed `engram_status`). When the response carries judgment data
@@ -308,7 +319,7 @@ not `hermes recall`.
   thread cannot overwrite each other's failure reason.
 - Non-primary `agent_context` (`subagent`, `cron`, `flush`): no capture and no
   session writes; write tools (`mem_save`, `mem_update`, `mem_session_summary`,
-  `mem_judge`, `mem_pin`, `mem_unpin`) return an error. Read tools work and do not
+  `mem_judge`, `mem_judge_many`, `mem_pin`, `mem_unpin`) return an error. Read tools work and do not
   write `state.json`.
 
 ## Session registration
@@ -411,6 +422,8 @@ nothing of it is skipped. A rewind keeps the mark.
 | `mem_search` limit | 10 default, 20 max | `tools.SEARCH_LIMIT_*` |
 | `mem_search` query / snippet | 500 / 300 chars | `tools.QUERY_MAX_CHARS`, `SEARCH_SNIPPET_MAX_CHARS` |
 | `mem_get_observation` content | 12000 chars | `tools.OBSERVATION_CONTENT_MAX_CHARS` |
+| `mem_get_observation` history version | 1000 chars each, 50 per page (Engram) | `tools.HISTORY_CONTENT_MAX_CHARS` |
+| `mem_judge_many` batch | 1..32 | `client.JUDGE_MANY_MAX` |
 | `mem_context` text | 6000 chars | `tools.CONTEXT_MAX_CHARS` |
 | `mem_timeline` before/after | 5 default, 20 max | `tools.TIMELINE_WINDOW_MAX` |
 | `/recall <id>` content | 800 chars | `format.DETAIL_CONTENT_MAX_CHARS` |
