@@ -221,6 +221,17 @@ writers; done inline, test-first, in ~400-line commits.
   not `config`: upstream `internal/project/detect.go` defines `config` as derived from
   `.engram/config.json` and `explicit_override` as the caller supplying a project name.
 
+- L12 Evidence (T18, parent): isolated Engram 3.6.0 smoke (copy of the live DB, port
+  17437) through the real provider: compact mem_search + prefetch, history page,
+  consolidate preview / 409 fingerprint_mismatch / confirm (#797, sources hidden from
+  search), judge-many outcomes, unknown_project refusal with available_projects,
+  finalize (#798, ended_at set), session provenance `git_remote`. Found: a tool
+  `mem_save` after finalize wrote into the ended root session; fixed test-first in
+  95f224a (now `<id>:resume:2`).
+- L13 Delivery: as v0.2/v0.3, the branch fast-forwards to main and is tagged v0.4.0.
+  Slices are the per-task commits bbc981f..95f224a (~2400 authored lines, ~55% tests);
+  each commit is one reviewable unit.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
