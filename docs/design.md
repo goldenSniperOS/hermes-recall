@@ -48,6 +48,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `mem_timeline` | `GET /timeline` | |
 | `mem_judge` | `POST /conflicts/judge` | `relation` ∈ related, compatible, scoped, conflicts_with, supersedes, not_conflict |
 | `mem_pin` / `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` | |
+| `mem_consolidate` | `POST /observations/consolidate` | Preview without `confirm`; apply with `confirm` + the approved plan's `fingerprint`; `expected_project` required; title/content redacted; never retried, never auto-confirmed |
 | `mem_judge_many` | `POST /conflicts/judge-many` | 1..32 judgments, each validated like `mem_judge` before anything is sent; effective session id; never retried |
 | `/recall`, `hermes recall status` | `GET /health` | Plus `state.json` |
 | `/recall <id>`, `hermes recall show <id>` | `GET /observations/{id}` | |
@@ -78,6 +79,8 @@ Results that carry an observation id include a `status` field:
 | `mem_unpin` | `🧠 unpinned #761` | `unpinned` |
 | `mem_judge` | `🧠 judged <judgment_id>: <relation>` | — |
 | `mem_judge_many` | `🧠 judged 3 of 4 (1 failed)` | — |
+| `mem_consolidate` (preview) | `🧠 consolidation preview: 2 observations into 1` | — |
+| `mem_consolidate` (confirm) | `🧠 consolidated #30 (soft-deleted #11, #12)` | `consolidated` |
 
 `mem_save` passes every key of Engram's response through (Engram's own `status`
 is renamed `engram_status`). When the response carries judgment data
@@ -85,6 +88,15 @@ is renamed `engram_status`). When the response carries judgment data
 gets a `next_step` hint telling the model to call `mem_judge`. Engram 2.0's HTTP
 `POST /observations` (`handleAddObservation`, `server.go`) answers only
 `{"id", "status"}` today, so this is forward compatibility, not a current path.
+
+`mem_consolidate` follows Engram's two-step contract. Without `confirm` the server
+writes nothing and the result carries the `plan`, its `fingerprint` and a
+`next_step` telling the model to show the plan to the user and to confirm only
+after they approve it. A 409 `fingerprint_mismatch` (the sources changed since
+the preview) is an error carrying the fresh `plan`; it is never confirmed
+automatically. A confirmation that timed out or got a 5xx may have been applied,
+so the error says the outcome is unknown and asks the model to check the source
+ids instead of retrying.
 
 ## Engram server lifecycle
 
@@ -217,15 +229,16 @@ Other plugins depend on this file (hermes-odd reads `last_memory_id`). It is a
   | Key | Type | Meaning |
   | --- | --- | --- |
   | `last_memory_id` | int | Observation id of the last successful id-yielding tool call |
-  | `last_action` | str | `saved`, `updated`, `observation`, `pinned`, `unpinned`, `session_summary` |
+  | `last_action` | str | `saved`, `updated`, `observation`, `pinned`, `unpinned`, `session_summary`, `consolidated` (added in 0.4.0) |
   | `project` | str | Engram project of that action (may be `""`) |
   | `updated_at` | str | ISO 8601 UTC, e.g. `2026-01-02T03:04:05Z` |
 
 - **Atomicity:** written to a temp file in the same directory, `fsync`ed, then
   `os.replace`d over the target. Readers never see a partial file.
 - **When:** after every successful `mem_save`, `mem_session_summary`,
-  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin` in the primary agent
-  context. Write failures are swallowed; the tool result is unaffected.
+  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin` and confirmed
+  `mem_consolidate` (the survivor id) in the primary agent context. Write failures
+  are swallowed; the tool result is unaffected.
 - **API:**
 
   ```python
@@ -319,7 +332,8 @@ not `hermes recall`.
   thread cannot overwrite each other's failure reason.
 - Non-primary `agent_context` (`subagent`, `cron`, `flush`): no capture and no
   session writes; write tools (`mem_save`, `mem_update`, `mem_session_summary`,
-  `mem_judge`, `mem_judge_many`, `mem_pin`, `mem_unpin`) return an error. Read tools work and do not
+  `mem_judge`, `mem_judge_many`, `mem_consolidate`, `mem_pin`, `mem_unpin`) return
+  an error. Read tools work and do not
   write `state.json`.
 
 ## Session registration

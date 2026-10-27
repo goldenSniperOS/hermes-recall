@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_engram import FakeEngram, Malformed, RecordedRequest
+from fake_engram import Delay, FakeEngram, Malformed, RecordedRequest
 
 from hermes_recall import tools as tools_module
 from hermes_recall.config import RecallConfig
@@ -34,6 +34,7 @@ EXPECTED_TOOLS = [
     "mem_judge",
     "mem_pin",
     "mem_unpin",
+    "mem_consolidate",
     "mem_judge_many",
 ]
 
@@ -887,6 +888,251 @@ def test_mem_judge_many_on_an_older_engram_needs_3_5_1(
     assert "engram serve" not in error
 
 
+# -- mem_consolidate ----------------------------------------------------------
+
+PLAN = {
+    "source_ids": [11, 12],
+    "sources": [{"id": 11, "title": "A"}, {"id": 12, "title": "B"}],
+    "project": PROJECT,
+    "fingerprint": "fp-1",
+    "survivor": {"title": "Merged", "content": "Both", "project": PROJECT},
+}
+CONSOLIDATE_ARGS: dict[str, Any] = {
+    "ids_to_delete": [11, "#12"],
+    "new_title": "Merged <private>t</private>",
+    "new_content": "Both <private>secret</private>",
+    "expected_project": PROJECT,
+}
+
+
+def consolidations(fake: FakeEngram) -> list[RecordedRequest]:
+    return [r for r in fake.requests if r.path == "/observations/consolidate"]
+
+
+def test_mem_consolidate_preview_returns_the_plan_and_asks_for_approval(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fake_engram.route(
+        "POST", "/observations/consolidate", (200, {"status": "preview", "plan": PLAN})
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS, type="decision")
+
+    assert only(fake_engram, "POST", "/observations/consolidate").json_body == {
+        "ids_to_delete": [11, 12],
+        "new_title": "Merged [REDACTED]",
+        "new_content": "Both [REDACTED]",
+        "expected_project": PROJECT,
+        "type": "decision",
+    }
+    assert [r.path for r in fake_engram.requests] == ["/observations/consolidate"]
+    assert result["engram_status"] == "preview"
+    assert result["plan"] == PLAN
+    assert result["fingerprint"] == "fp-1"
+    assert result["status"] == "🧠 consolidation preview: 2 observations into 1"
+    assert "user" in result["next_step"]
+    assert "confirm: true" in result["next_step"]
+    assert '"fp-1"' in result["next_step"]
+    assert not state_path(tmp_path).exists()
+
+
+def test_mem_consolidate_confirm_applies_and_remembers_the_survivor(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    survivor = {"id": 30, "title": "Merged", "project": PROJECT, "type": "decision"}
+    fake_engram.route(
+        "POST",
+        "/observations/consolidate",
+        (
+            201,
+            {
+                "status": "consolidated",
+                "plan": PLAN,
+                "survivor": survivor,
+                "soft_deleted_ids": [11, 12],
+            },
+        ),
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(
+        provider,
+        "mem_consolidate",
+        **CONSOLIDATE_ARGS,
+        topic_key="merge/ab",
+        confirm=True,
+        fingerprint="fp-1",
+    )
+
+    assert only(fake_engram, "POST", "/observations/consolidate").json_body == {
+        "ids_to_delete": [11, 12],
+        "new_title": "Merged [REDACTED]",
+        "new_content": "Both [REDACTED]",
+        "expected_project": PROJECT,
+        "topic_key": "merge/ab",
+        "confirm": True,
+        "fingerprint": "fp-1",
+    }
+    assert result["id"] == 30
+    assert result["status"] == "🧠 consolidated #30 (soft-deleted #11, #12)"
+    assert result["engram_status"] == "consolidated"
+    assert result["soft_deleted_ids"] == [11, 12]
+    assert result["survivor"] == survivor
+    state = read_state(tmp_path)
+    assert (state["last_memory_id"], state["last_action"], state["project"]) == (
+        30,
+        "consolidated",
+        PROJECT,
+    )
+
+
+def test_mem_consolidate_fingerprint_mismatch_returns_the_fresh_plan_unconfirmed(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fresh = {**PLAN, "fingerprint": "fp-2"}
+    fake_engram.route(
+        "POST",
+        "/observations/consolidate",
+        (
+            409,
+            {
+                "error": "consolidation fingerprint mismatch",
+                "code": "fingerprint_mismatch",
+                "plan": fresh,
+            },
+        ),
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS, confirm=True, fingerprint="fp-1")
+
+    # Never auto-confirmed with the fresh fingerprint: exactly one request.
+    assert len(consolidations(fake_engram)) == 1
+    assert result["code"] == "fingerprint_mismatch"
+    assert result["plan"] == fresh
+    assert "Nothing was consolidated" in result["error"]
+    assert "user" in result["error"]
+    assert not state_path(tmp_path).exists()
+
+
+def test_mem_consolidate_is_never_retried_after_a_server_failure(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fake_engram.route(
+        "POST",
+        "/observations/consolidate",
+        (500, {"error": "consolidation failed", "code": "consolidation_failed"}),
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS, confirm=True, fingerprint="fp-1")
+
+    assert len(consolidations(fake_engram)) == 1
+    assert result["code"] == "consolidation_failed"
+    assert "outcome is unknown" in result["error"]
+    assert "do not retry" in result["error"]
+    assert not state_path(tmp_path).exists()
+
+
+def test_mem_consolidate_is_never_retried_after_a_timeout(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    from hermes_recall import client as client_module
+
+    wire(fake_engram)
+    fake_engram.route(
+        "POST", "/observations/consolidate", Delay(1.0, (201, {"status": "consolidated"}))
+    )
+    provider = make_provider(fake_engram.base_url)
+    monkeypatch.setattr(client_module, "WRITE_TIMEOUT_S", 0.2)
+    fake_engram.reset()
+
+    result = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS, confirm=True, fingerprint="fp-1")
+
+    assert len(consolidations(fake_engram)) == 1
+    assert "outcome is unknown" in result["error"]
+    assert "engram serve" not in result["error"]
+    assert not state_path(tmp_path).exists()
+
+
+def test_mem_consolidate_reports_an_owner_refusal_with_its_code(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    fake_engram.route(
+        "POST",
+        "/observations/consolidate",
+        (403, {"error": "observation project mismatch", "code": "project_mismatch"}),
+    )
+    provider = make_provider(fake_engram.base_url)
+
+    result = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS)
+
+    assert result == {
+        "error": "Engram refused the consolidation: POST /observations/consolidate: "
+        "HTTP 403 observation project mismatch",
+        "code": "project_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"ids_to_delete": None}, "ids_to_delete"),
+        ({"ids_to_delete": [11]}, "ids_to_delete"),
+        ({"ids_to_delete": [11, 11]}, "distinct"),
+        ({"ids_to_delete": [11, "#11"]}, "distinct"),
+        ({"ids_to_delete": [11, 0]}, "ids_to_delete"),
+        ({"ids_to_delete": [11, -2]}, "ids_to_delete"),
+        ({"ids_to_delete": [11, True]}, "ids_to_delete"),
+        ({"ids_to_delete": "11,12"}, "ids_to_delete"),
+        ({"new_title": " "}, "new_title"),
+        ({"new_content": "  "}, "new_content"),
+        ({"expected_project": ""}, "expected_project"),
+        ({"confirm": True}, "fingerprint"),
+    ],
+)
+def test_mem_consolidate_refuses_bad_arguments_without_a_request(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path, override: Any, message: str
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    args = {**CONSOLIDATE_ARGS, **override}
+    args = {key: value for key, value in args.items() if value is not None}
+    error = call(provider, "mem_consolidate", **args)["error"]
+
+    assert message in error
+    assert fake_engram.requests == []
+    assert not state_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "older",
+    [Malformed(404, b"404 page not found\n"), Malformed(405, b"Method Not Allowed\n")],
+)
+def test_mem_consolidate_on_an_older_engram_needs_3_5_1(
+    fake_engram: FakeEngram, make_provider: Any, older: Malformed
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/observations/consolidate", older)
+    provider = make_provider(fake_engram.base_url)
+
+    error = call(provider, "mem_consolidate", **CONSOLIDATE_ARGS)["error"]
+
+    assert "mem_consolidate needs Engram >= 3.5.1" in error
+
+
 # -- server refusals are not outages (S8) --------------------------------------
 
 
@@ -976,6 +1222,7 @@ def test_mem_pin_missing_observation_is_an_error(
         ("mem_pin", {"id": 761}),
         ("mem_unpin", {"id": 761}),
         ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
+        ("mem_consolidate", CONSOLIDATE_ARGS),
     ],
 )
 def test_non_primary_write_tools_are_refused(
@@ -1023,6 +1270,7 @@ def test_non_primary_read_tools_still_work(fake_engram: FakeEngram, make_provide
         ("mem_pin", {"id": 761}),
         ("mem_unpin", {"id": 761}),
         ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
+        ("mem_consolidate", CONSOLIDATE_ARGS),
     ],
 )
 def test_engram_down_is_a_json_error_never_a_raise(

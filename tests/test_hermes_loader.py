@@ -33,7 +33,7 @@ import pytest
 
 HERMES_AGENT_DIR = Path.home() / ".hermes" / "hermes-agent"
 HERMES_VENV_PYTHON = HERMES_AGENT_DIR / "venv" / "bin" / "python"
-EXPECTED_TOOL_COUNT = 11
+EXPECTED_TOOL_COUNT = 12
 _SKIP_MARKER = "RECALL-LOADER-SKIP:"
 _RESULT_MARKER = "RECALL-LOADER-RESULT:"
 

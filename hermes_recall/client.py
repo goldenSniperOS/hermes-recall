@@ -568,6 +568,47 @@ class EngramClient:
             body["session_id"] = session_id
         return _as_dict(self._request("POST", "/conflicts/judge-many", body=body))
 
+    def consolidate(
+        self,
+        ids_to_delete: list[int],
+        new_title: str,
+        new_content: str,
+        expected_project: str,
+        *,
+        type_: str = "",
+        topic_key: str = "",
+        confirm: bool = False,
+        fingerprint: str = "",
+    ) -> dict[str, Any] | None:
+        """``POST /observations/consolidate`` → a preview (200) or the applied plan (201).
+
+        Engram 3.6 (agentops.ParseConsolidate). Without ``confirm`` it writes nothing
+        and answers ``{"status": "preview", "plan"}``; with ``confirm`` and the plan's
+        ``fingerprint`` it soft-deletes the sources into one survivor and answers
+        ``{"status": "consolidated", "plan", "survivor", "soft_deleted_ids"}``. The
+        server refuses any key outside its list, so only the given ones are sent.
+        """
+        if confirm and not fingerprint.strip():
+            # The server 400s it ("fingerprint is required when confirm is true").
+            self._record_error(
+                "POST /observations/consolidate: refused locally, confirm without fingerprint"
+            )
+            return None
+        body: dict[str, Any] = {
+            "ids_to_delete": list(ids_to_delete),
+            "new_title": new_title,
+            "new_content": new_content,
+            "expected_project": expected_project,
+        }
+        for key, value in (("type", type_), ("topic_key", topic_key)):
+            if value.strip():
+                body[key] = value
+        if confirm:
+            body["confirm"] = True
+        if fingerprint.strip():
+            body["fingerprint"] = fingerprint
+        return _as_dict(self._request("POST", "/observations/consolidate", body=body))
+
     def pin_observation(self, observation_id: int) -> dict[str, Any] | None:
         """``PUT /observations/{id}/pin`` → ``{"id", "pinned": true}``."""
         return _as_dict(self._request("PUT", f"/observations/{observation_id}/pin"))

@@ -19,8 +19,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .client import JUDGE_MANY_MAX, EngramClient
+from .client import JUDGE_MANY_MAX, TIMEOUT_ERROR_MARKER, EngramClient
 from .format import (
+    consolidated_status,
     observation_status,
     pinned_status,
     render_observation_detail,
@@ -100,6 +101,11 @@ def _i(description: str) -> dict[str, Any]:
 
 
 _ID = _i("Observation id")
+# Bare types for parameters whose name says it all: every byte here is paid on
+# every API call (see test_total_schema_payload_stays_compact).
+_STR: dict[str, Any] = {"type": "string"}
+_BOOL: dict[str, Any] = {"type": "boolean"}
+_INT: dict[str, Any] = {"type": "integer"}
 _PROJECT = _s("Project (default: current)")
 
 _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
@@ -150,12 +156,8 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     ),
     _schema(
         "mem_get_observation",
-        "Get one observation in full, optionally with its version history.",
-        {
-            "id": _ID,
-            "include_history": {"type": "boolean", "description": "Add prior versions"},
-            "history_cursor": _i("history_cursor of the previous page"),
-        },
+        "Get one observation in full, optionally with prior versions.",
+        {"id": _ID, "include_history": _BOOL, "history_cursor": _INT},
         ["id"],
     ),
     _schema(
@@ -196,26 +198,24 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     _schema("mem_pin", "Pin an observation so recall favors it.", {"id": _ID}, ["id"]),
     _schema("mem_unpin", "Unpin an observation.", {"id": _ID}, ["id"]),
     _schema(
-        "mem_judge_many",
-        "Resolve up to 32 conflict candidates at once; never retried.",
+        "mem_consolidate",
+        "Merge observations into one. Preview first; confirm only after user approval.",
         {
-            "judgments": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": JUDGE_MANY_MAX,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "judgment_id": {"type": "string"},
-                        "relation": {"type": "string", "enum": list(JUDGE_RELATIONS)},
-                        "reason": {"type": "string"},
-                        "evidence": {"type": "string"},
-                        "confidence": {"type": "number"},
-                    },
-                    "required": ["judgment_id", "relation"],
-                },
-            }
+            "ids_to_delete": {"type": "array", "items": {"type": "integer"}},
+            "new_title": _STR,
+            "new_content": _STR,
+            "expected_project": _STR,
+            "type": _STR,
+            "topic_key": _STR,
+            "confirm": _BOOL,
+            "fingerprint": _STR,
         },
+        ["ids_to_delete", "new_title", "new_content", "expected_project"],
+    ),
+    _schema(
+        "mem_judge_many",
+        "Batch mem_judge: [{judgment_id, relation, reason?, evidence?, confidence?}]",
+        {"judgments": {"type": "array", "items": {"type": "object"}}},
         ["judgments"],
     ),
 )
@@ -229,6 +229,7 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "mem_judge",
         "mem_pin",
         "mem_unpin",
+        "mem_consolidate",
         "mem_judge_many",
     }
 )
@@ -797,6 +798,117 @@ def _mem_judge_many(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
     return {**judged, "status": f"{status} ({failed} failed)" if failed else status}
 
 
+def _ids_arg(args: dict[str, Any], key: str) -> list[int]:
+    """At least two distinct positive observation ids (``#12`` and ``"12"`` accepted)."""
+    raw = args.get(key)
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ToolError(f"'{key}' must be a list of at least two observation ids")
+    ids = []
+    for value in raw:
+        try:
+            ids.append(_id_arg({key: value}, key))
+        except ToolError:
+            raise ToolError(f"'{key}' must hold positive integer observation ids") from None
+    if len(set(ids)) != len(ids):
+        raise ToolError(f"'{key}' must hold distinct observation ids")
+    return ids
+
+
+def _consolidation_uncertain(client: Any) -> bool:
+    """Whether a failed *confirmed* consolidation may still have been applied.
+
+    A timeout or a 5xx (``consolidation_failed``) leaves the outcome unknown; a 4xx
+    or a refused connection definitely wrote nothing.
+    """
+    status = client.last_error_status
+    if status is None:
+        return TIMEOUT_ERROR_MARKER in client.last_error_text()
+    return status >= 500
+
+
+def _mem_consolidate(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
+    """POST /observations/consolidate: preview, or apply an approved preview.
+
+    Never retried and never auto-confirmed. A 409 ``fingerprint_mismatch`` hands the
+    fresh plan back for the user to approve again; a confirmation that timed out or
+    hit a 5xx may have been applied, so the model is told to verify, not to retry.
+    """
+    ids = _ids_arg(args, "ids_to_delete")
+    title = strip_private(_str_arg(args, "new_title", required=True))
+    content = strip_private(_str_arg(args, "new_content", required=True))
+    if not title or not content:
+        raise ToolError("'new_title' and 'new_content' must not be empty after redaction")
+    expected_project = _str_arg(args, "expected_project")
+    if not expected_project:
+        raise ToolError("'expected_project' is required: the project that owns every source")
+    confirm = _bool_arg(args, "confirm")
+    fingerprint = _str_arg(args, "fingerprint")
+    if confirm and not fingerprint:
+        raise ToolError("'fingerprint' from the approved preview is required with confirm")
+    response = env.client.consolidate(
+        ids,
+        title,
+        content,
+        expected_project,
+        type_=_str_arg(args, "type"),
+        topic_key=_str_arg(args, "topic_key"),
+        confirm=confirm,
+        fingerprint=fingerprint,
+    )
+    if response is None:
+        raise _consolidation_error(env, confirm)
+    plan = response.get("plan") if isinstance(response.get("plan"), dict) else {}
+    engram_status = response.get("status")
+    if engram_status != "consolidated":
+        fresh = plan.get("fingerprint", "")
+        return {
+            "engram_status": engram_status,
+            "status": f"🧠 consolidation preview: {len(ids)} observations into 1",
+            "plan": plan,
+            "fingerprint": fresh,
+            "next_step": (
+                "Nothing was written. Show this plan to the user. Only after they approve "
+                "it, call mem_consolidate again with the same arguments plus confirm: true "
+                f'and fingerprint: "{fresh}".'
+            ),
+        }
+    survivor = response.get("survivor") if isinstance(response.get("survivor"), dict) else {}
+    survivor_id = _observation_id(survivor)
+    deleted = response.get("soft_deleted_ids")
+    deleted_ids = deleted if isinstance(deleted, list) else ids
+    project = survivor.get("project") if isinstance(survivor.get("project"), str) else ""
+    _remember(env, survivor_id, "consolidated", project or expected_project)
+    return {
+        "id": survivor_id,
+        "status": consolidated_status(survivor_id, deleted_ids),
+        "engram_status": engram_status,
+        "survivor": survivor,
+        "soft_deleted_ids": deleted_ids,
+        "plan": plan,
+    }
+
+
+def _consolidation_error(env: ToolEnv, confirm: bool) -> ToolError:
+    client = env.client
+    body = getattr(client, "last_error_body", None) or {}
+    if body.get("code") == "fingerprint_mismatch":
+        plan = body.get("plan") if isinstance(body.get("plan"), dict) else {}
+        return ToolError(
+            "The sources changed since the preview (fingerprint_mismatch). Nothing was "
+            "consolidated. Show the fresh plan to the user; confirm only with its "
+            f'fingerprint "{plan.get("fingerprint", "")}" after they approve it.',
+            code="fingerprint_mismatch",
+            plan=plan,
+        )
+    if confirm and _consolidation_uncertain(client):
+        return ToolError(
+            f"Consolidation outcome is unknown ({client.last_error_text()}): do not retry. "
+            "Check the source ids with mem_get_observation before doing anything else.",
+            **_refusal_fields(client),
+        )
+    return _workflow_error(env, "mem_consolidate", "consolidation")
+
+
 def _pin_handler(pinned: bool) -> Callable[[ToolEnv, dict[str, Any]], dict[str, Any]]:
     def handler(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
         observation_id = _id_arg(args, "id")
@@ -822,6 +934,7 @@ _HANDLERS: dict[str, Callable[[ToolEnv, dict[str, Any]], Any]] = {
     "mem_judge": _mem_judge,
     "mem_pin": _pin_handler(True),
     "mem_unpin": _pin_handler(False),
+    "mem_consolidate": _mem_consolidate,
     "mem_judge_many": _mem_judge_many,
 }
 

@@ -50,4 +50,5 @@ provides_tools:
   - mem_judge
   - mem_pin
   - mem_unpin
+  - mem_consolidate
   - mem_judge_many

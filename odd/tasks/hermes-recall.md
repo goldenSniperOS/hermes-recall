@@ -136,7 +136,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 ### Tasks
 
 - [x] T12 S2+S4+S8 client error bodies, history, judge-many, refusal wording. Route: inline.
-- [ ] T13 S3 mem_consolidate. Route: inline.
+- [x] T13 S3 mem_consolidate. Route: inline.
 - [ ] T14 S5 mem_session_finalize + end suppression. Route: inline.
 - [ ] T15 S1 compact search (tool + prefetch). Route: inline.
 - [ ] T16 S6 capture provenance. Route: inline (own commit; writes data).
@@ -177,6 +177,14 @@ writers; done inline, test-first, in ~400-line commits.
   whole batch, naming the index, before sending anything. The T12 commit exceeds
   ~400 lines (about half are tests) because S2+S4+S8 share the client error-body
   change.
+- L6 Decisions (T13, worker): with 12 tools the payload hit 6048 bytes, so the new
+  schemas use bare `{"type": ...}` params where the name says it all, and
+  `mem_judge_many` carries the item shape in its description instead of an item
+  schema (relations are validated locally, as `mem_judge` does). The L3 cap of 5600
+  is kept. `mem_consolidate` adds `last_action: "consolidated"` to `state.json` (an
+  additive value; `hermes_recall/state.py` lists the values in its docstring but
+  was outside this worker's edit surface). A confirmation is "outcome unknown" on
+  a timeout or any 5xx; a preview failure is reported like any other refusal.
 
 ## Acceptance criteria
 
@@ -263,6 +271,8 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   manifest's mem_* tools are not added by register(); the manifest only changed
   its version since v0.2.0, and the tools come from the memory provider. Waiting
   for the owner's /restart; then Engram can move to v3 (brew stable is 2.2.0).
+- T12 history, mem_judge_many, refusal-aware errors: `bbc981f` (Pi gentle-ai-worker,
+  test-first).
 
 ## Next step
 

@@ -110,6 +110,7 @@ The model gets these tools (compact schemas, about 4 KB in total):
 | `mem_timeline` | `GET /timeline` |
 | `mem_judge` | `POST /conflicts/judge` |
 | `mem_pin`, `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` |
+| `mem_consolidate` | `POST /observations/consolidate` (Engram >= 3.5.1; preview, then confirm) |
 | `mem_judge_many` | `POST /conflicts/judge-many` (Engram >= 3.5.1) |
 
 Every write result carries a `status` such as `🧠 saved #761`, and the last

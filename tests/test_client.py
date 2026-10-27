@@ -715,6 +715,53 @@ def test_judge_many_refuses_a_batch_outside_1_to_32_without_a_request(
     assert fake_engram.requests == []
 
 
+def test_consolidate_preview_sends_only_the_given_keys(fake_engram: FakeEngram) -> None:
+    preview = {"status": "preview", "plan": {"fingerprint": "fp"}}
+    fake_engram.route("POST", "/observations/consolidate", (200, preview))
+
+    result = client_for(fake_engram).consolidate([11, 12], "T", "C", "proj")
+
+    assert result == preview
+    request = fake_engram.find("POST", "/observations/consolidate")
+    assert request is not None
+    # The server refuses any key outside its list, so nothing else may ride along.
+    assert request.json_body == {
+        "ids_to_delete": [11, 12],
+        "new_title": "T",
+        "new_content": "C",
+        "expected_project": "proj",
+    }
+
+
+def test_consolidate_confirm_sends_the_fingerprint(fake_engram: FakeEngram) -> None:
+    fake_engram.route("POST", "/observations/consolidate", (201, {"status": "consolidated"}))
+
+    client_for(fake_engram).consolidate(
+        [11, 12], "T", "C", "proj", type_="decision", topic_key="k", confirm=True, fingerprint="fp"
+    )
+
+    assert fake_engram.requests[-1].json_body == {
+        "ids_to_delete": [11, 12],
+        "new_title": "T",
+        "new_content": "C",
+        "expected_project": "proj",
+        "type": "decision",
+        "topic_key": "k",
+        "confirm": True,
+        "fingerprint": "fp",
+    }
+
+
+def test_consolidate_confirm_without_fingerprint_makes_no_request(
+    fake_engram: FakeEngram,
+) -> None:
+    client = client_for(fake_engram)
+
+    assert client.consolidate([11, 12], "T", "C", "proj", confirm=True) is None
+    assert "refused locally" in client.last_error_text()
+    assert fake_engram.requests == []
+
+
 # -- 12. fail-soft sweep ------------------------------------------------------
 
 # Every public endpoint method, with arguments good enough to reach the network.
@@ -739,6 +786,7 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
     "stats": ((), {}),
     "judge_conflict": (("rel-1", "related"), {}),
     "judge_many": (([{"judgment_id": "rel-1", "relation": "related"}],), {}),
+    "consolidate": (([11, 12], "T", "C", "proj"), {}),
     "pin_observation": ((761,), {}),
     "unpin_observation": ((761,), {}),
 }

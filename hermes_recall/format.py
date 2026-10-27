@@ -165,6 +165,12 @@ def updated_status(observation_id: Any) -> str:
     return f"🧠 updated #{observation_id}"
 
 
+def consolidated_status(survivor_id: Any, deleted_ids: Any) -> str:
+    """Render the confirmation of an applied consolidation: the survivor, then the sources."""
+    sources = ", ".join(f"#{i}" for i in deleted_ids) if isinstance(deleted_ids, list) else ""
+    return f"🧠 consolidated #{survivor_id} (soft-deleted {sources})"
+
+
 def observation_status(observation_id: Any) -> str:
     """Render the read confirmation for a fetched observation."""
     return f"🧠 observation #{observation_id}"
