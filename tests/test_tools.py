@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from fake_engram import Delay, FakeEngram, Malformed, RecordedRequest
 
+from hermes_recall import provider as provider_module
 from hermes_recall import tools as tools_module
 from hermes_recall.config import RecallConfig
 from hermes_recall.provider import RecallProvider
@@ -49,6 +50,9 @@ OBSERVATION = {
     "topic_key": "",
     "created_at": "2026-01-02 03:04:05",
 }
+
+# What `wire` detects carries no project_source, so capture evidence is unknown.
+UNKNOWN_PROVENANCE = {"source": "unknown", "directory": provider_module._working_directory()}
 
 # -- helpers ------------------------------------------------------------------
 
@@ -310,6 +314,7 @@ def test_mem_save_request_status_and_state(
         "project": PROJECT,
         "scope": "project",
         "topic_key": "loader/fix",
+        "project_provenance": UNKNOWN_PROVENANCE,
     }
     assert result["id"] == 900
     assert result["status"] == "🧠 saved #900"
@@ -419,6 +424,7 @@ def test_mem_session_summary_request_status_and_state(
         "content": "## Goal\nship T6",
         "project": PROJECT,
         "scope": "project",
+        "project_provenance": UNKNOWN_PROVENANCE,
     }
     assert result["status"] == "🧠 saved #900"
     assert read_state(tmp_path)["last_action"] == "session_summary"
@@ -1615,8 +1621,6 @@ def test_state_write_failure_is_swallowed(
 
 
 def test_memory_tool_results_are_never_passively_captured() -> None:
-    from hermes_recall import provider as provider_module
-
     assert provider_module._MEMORY_TOOL_NAMES == tools_module.TOOL_NAMES
 
 

@@ -276,6 +276,8 @@ class ToolEnv:
     # Told the effective session id once a finalize ended it (or may have), so the
     # provider does not post ``/end`` for it and re-registers before the next write.
     session_finalized: Callable[[str], None] | None = None
+    # The ``project_provenance`` evidence for a write to the given project.
+    provenance: Callable[[str], dict[str, str]] | None = None
 
     def write_session_id(self) -> str:
         """The session id to attribute a write to right now."""
@@ -535,6 +537,7 @@ def _save(
             project=project,
             scope=scope,
             topic_key=topic_key,
+            provenance=env.provenance(project) if env.provenance is not None else None,
         )
 
     saved = with_session_retry(env.client, post, lambda: env.register_session(project))

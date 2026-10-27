@@ -138,6 +138,31 @@ SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 # without limit for the life of the process.
 _QUEUE_MAXSIZE = 256
 
+# ``project_provenance.source`` values Engram 3.6 accepts (docs/CAPTURE-PROJECT-
+# PROVENANCE.md, store.ProjectProvenance.Validate). Anything else is a 400 that
+# would lose the write, so it is replaced by ``unknown``.
+PROVENANCE_UNKNOWN = "unknown"
+PROVENANCE_CONFIG = "config"
+PROVENANCE_SOURCES = frozenset(
+    {
+        "git_remote",
+        "git_root",
+        "git_child",
+        "dir_basename",
+        "ambiguous",
+        "explicit_override",
+        "session",
+        "user_selected_after_ambiguous_project",
+        "request_body",
+        "config",
+        "all_projects",
+        "process_override",
+        "stored_project",
+        "unbound_git",
+        "unknown",
+    }
+)
+
 # Static instructions for the model. A **module-level constant** so the string is
 # byte-stable for the whole process: Hermes assembles the system prompt from
 # provider blocks and the result is part of the cached prompt prefix, so a single
@@ -217,8 +242,11 @@ class RecallProvider(MemoryProvider):
         self._agent_context: str = "primary"
         self._writes_enabled: bool = True
 
-        # Project detection cache.
+        # Project detection cache. ``_project_source`` is Engram's ``project_source``
+        # for the detected project (or ``config`` for ``memory.recall.project``): the
+        # evidence a capture write sends as ``project_provenance``.
         self._project: str = ""
+        self._project_source: str = ""
         self._project_detected: bool = False
 
         # Recall state. Reset at the top of every prefetch so recall_status() can
@@ -540,8 +568,10 @@ class RecallProvider(MemoryProvider):
         "unknown", not an error, and is reported as ``""`` just like a failure.
         """
         try:
+            self._project_source = ""
             override = str(self._config.project_override or "").strip()
             if override:
+                self._project_source = PROVENANCE_CONFIG
                 return override
             if self._foreign_reason():
                 return ""
@@ -549,6 +579,8 @@ class RecallProvider(MemoryProvider):
             if not isinstance(payload, dict):
                 return ""
             project = payload.get("project")
+            source = payload.get("project_source")
+            self._project_source = source if isinstance(source, str) else ""
             return project.strip() if isinstance(project, str) else ""
         except Exception:
             logger.debug("recall: project detection failed (non-fatal)", exc_info=True)
@@ -571,6 +603,23 @@ class RecallProvider(MemoryProvider):
             self._project_detected = True
         return project
 
+    def _provenance(self, project: str) -> dict[str, str]:
+        """The ``project_provenance`` evidence for a capture write to ``project``.
+
+        Mirrors gentle-engram's ``captureProjectProvenance``: the detection source
+        only describes the detected project, so a write to any other project is
+        ``unknown``. A source outside Engram's vocabulary is sent as ``unknown`` too,
+        because Engram 400s it and the whole write would be lost.
+        """
+        source = PROVENANCE_UNKNOWN
+        if project and project == self._project and self._project_source in PROVENANCE_SOURCES:
+            source = self._project_source
+        provenance = {"source": source}
+        directory = _working_directory()
+        if directory:
+            provenance["directory"] = directory
+        return provenance
+
     def _reset_project_cache(self) -> None:
         """Forget the detected project and the once-per-session context flag.
 
@@ -579,6 +628,7 @@ class RecallProvider(MemoryProvider):
         per-session capture bookkeeping.
         """
         self._project = ""
+        self._project_source = ""
         self._project_detected = False
         self._context_fetched = False
 
@@ -838,7 +888,10 @@ class RecallProvider(MemoryProvider):
                     session_id,
                     register,
                     lambda: self._client.add_prompt(
-                        self._effective_session_id(session_id), content, project=project
+                        self._effective_session_id(session_id),
+                        content,
+                        project=project,
+                        provenance=self._provenance(project),
                     ),
                 )
 
@@ -920,6 +973,7 @@ class RecallProvider(MemoryProvider):
                                 c,
                                 project=project,
                                 source=s,
+                                provenance=self._provenance(project),
                             ),
                         )
                     except Exception:
@@ -1019,6 +1073,7 @@ class RecallProvider(MemoryProvider):
                         content,
                         project=project,
                         source="subagent",
+                        provenance=self._provenance(project),
                     ),
                 )
 
@@ -1288,6 +1343,7 @@ class RecallProvider(MemoryProvider):
                 project=project,
                 scope="project",
                 topic_key="session/compaction-recovery",
+                provenance=self._provenance(project),
             )
 
         register_once = self._registration_for(session_id, project)
@@ -1369,6 +1425,7 @@ class RecallProvider(MemoryProvider):
                     or self._register_session_now(project, session_id=runtime_id)
                 ),
                 session_finalized=lambda _effective: self._session_finalized(runtime_id),
+                provenance=self._provenance,
             )
             return tools_module.handle_tool_call(env, tool_name, args)
         except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
@@ -1395,7 +1452,10 @@ class RecallProvider(MemoryProvider):
         if not target:
             return False
         created = self._client.create_session(
-            target_session, target, directory=_working_directory()
+            target_session,
+            target,
+            directory=_working_directory(),
+            provenance=self._provenance(target),
         )
         if created is None:
             return False

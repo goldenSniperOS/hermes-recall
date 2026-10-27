@@ -163,6 +163,11 @@ def test_on_turn_start_posts_the_prompt(fake_engram: FakeEngram, provider_factor
         "session_id": SESSION,
         "content": "why does the loader skip my provider",
         "project": PROJECT,
+        # No project_source in the detection answer: the evidence is unknown.
+        "project_provenance": {
+            "source": "unknown",
+            "directory": provider_module._working_directory(),
+        },
     }
 
 
@@ -1055,3 +1060,132 @@ def test_the_first_sync_after_startup_skips_a_resumed_transcript(
     assert provider._drain_for_test()
 
     assert captured(fake_engram) == [("read_file", long_text("n"))]
+
+
+# -- capture project provenance (Engram 3.6, S6) --------------------------------
+
+WORKDIR = "/work/hermes-recall"
+PROVENANCE_ROUTES = ("/sessions", "/prompts", "/observations", "/observations/passive")
+
+
+def wire_provenance(fake: FakeEngram, source: Any) -> None:
+    wire_engram(fake)
+    detected: dict[str, Any] = {"project": PROJECT}
+    if source is not None:
+        detected["project_source"] = source
+    fake.route("GET", "/project/current", (200, detected))
+    fake.route("POST", "/observations", (201, {"id": 900, "status": "saved"}))
+    fake.route(
+        "POST",
+        f"/sessions/{SESSION}/finalize",
+        (200, {"session_id": SESSION, "state": "finalized", "summary_id": 901}),
+    )
+
+
+def every_capture_write(provider: RecallProvider) -> None:
+    """Drive each write path that carries provenance, then drain."""
+    provider.on_turn_start(1, "why does the loader skip my provider")
+    provider.sync_turn("ask", long_text("a"), messages=[tool_message(long_text("t"), name="read")])
+    provider.on_delegation("look at the loader please", long_text("d"))
+    assert provider._drain_for_test()
+    provider.handle_tool_call("mem_save", {"title": "T", "content": "C"})
+    provider.handle_tool_call("mem_session_summary", {"content": "## Goal\nship"})
+    provider.on_pre_compress(
+        [{"role": "user", "content": "a question"}, {"role": "assistant", "content": "an answer"}]
+    )
+
+
+def provenances(fake: FakeEngram) -> list[tuple[str, Any]]:
+    """``(path, project_provenance)`` for every capture write, in order."""
+    return [
+        (r.path, r.json_body.get("project_provenance"))
+        for r in fake.requests
+        if r.method == "POST" and r.path in PROVENANCE_ROUTES
+    ]
+
+
+def test_every_capture_write_carries_the_detected_provenance(
+    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
+    wire_provenance(fake_engram, "git_remote")
+    provider = provider_factory(fake_engram.base_url)
+
+    every_capture_write(provider)
+
+    expected = {"source": "git_remote", "directory": WORKDIR}
+    assert provenances(fake_engram) == [
+        ("/sessions", expected),
+        ("/prompts", expected),
+        ("/observations/passive", expected),
+        ("/observations/passive", expected),
+        ("/observations/passive", expected),
+        ("/observations", expected),
+        ("/observations", expected),
+        ("/observations", expected),
+    ]
+
+
+def test_finalize_never_carries_provenance(
+    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Its body is strict: {project, summary} and nothing else.
+    monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
+    wire_provenance(fake_engram, "git_remote")
+    provider = provider_factory(fake_engram.base_url)
+
+    provider.handle_tool_call("mem_session_finalize", {"summary": "done"})
+
+    request = fake_engram.find("POST", f"/sessions/{SESSION}/finalize")
+    assert request is not None
+    assert request.json_body == {"project": PROJECT, "summary": "done"}
+
+
+@pytest.mark.parametrize("source", ["cwd", "", None, "made_up_source", 7])
+def test_a_source_outside_engrams_set_is_sent_as_unknown(
+    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch, source: Any
+) -> None:
+    # Engram 400s an unsupported source, which would lose the whole write.
+    monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
+    wire_provenance(fake_engram, source)
+    provider = provider_factory(fake_engram.base_url)
+
+    every_capture_write(provider)
+
+    rows = provenances(fake_engram)
+    assert len(rows) == 8
+    assert {path for path, _ in rows} == set(PROVENANCE_ROUTES)
+    assert all(p == {"source": "unknown", "directory": WORKDIR} for _, p in rows)
+
+
+def test_a_configured_project_is_sent_as_config(
+    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
+    wire_provenance(fake_engram, "git_remote")
+    provider = provider_factory(fake_engram.base_url, project_override=PROJECT)
+
+    every_capture_write(provider)
+
+    rows = provenances(fake_engram)
+    assert len(rows) == 8
+    assert all(p == {"source": "config", "directory": WORKDIR} for _, p in rows)
+    assert fake_engram.find("GET", "/project/current") is None
+
+
+def test_a_write_to_another_project_is_sent_as_unknown(
+    fake_engram: FakeEngram, provider_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The detection evidence describes the detected project only.
+    monkeypatch.setenv("TERMINAL_CWD", WORKDIR)
+    wire_provenance(fake_engram, "git_remote")
+    provider = provider_factory(fake_engram.base_url)
+    fake_engram.reset()
+
+    provider.handle_tool_call("mem_save", {"title": "T", "content": "C", "project": "other"})
+    provider.handle_tool_call("mem_save", {"title": "T", "content": "C"})
+
+    assert provenances(fake_engram) == [
+        ("/observations", {"source": "unknown", "directory": WORKDIR}),
+        ("/observations", {"source": "git_remote", "directory": WORKDIR}),
+    ]

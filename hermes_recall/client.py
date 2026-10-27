@@ -257,7 +257,11 @@ class EngramClient:
     # -- Sessions ------------------------------------------------------------
 
     def create_session(
-        self, session_id: str, project: str, directory: str = ""
+        self,
+        session_id: str,
+        project: str,
+        directory: str = "",
+        provenance: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """``POST /sessions`` → ``{"id", "status"}`` (HTTP 201).
 
@@ -277,6 +281,7 @@ class EngramClient:
         }
         if directory.strip():
             body["directory"] = directory
+        _add_provenance(body, provenance)
         return _as_dict(self._request("POST", "/sessions", body=body))
 
     def end_session(self, session_id: str, summary: str = "") -> dict[str, Any] | None:
@@ -331,6 +336,7 @@ class EngramClient:
         scope: str = "project",
         topic_key: str = "",
         tool_name: str = "",
+        provenance: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """``POST /observations`` → ``{"id": <int>, "status": "saved"}`` (HTTP 201)."""
         # The server requires session_id, title and content, and validates the
@@ -366,6 +372,7 @@ class EngramClient:
         ):
             if value.strip():
                 body[key] = value
+        _add_provenance(body, provenance)
         return _as_dict(self._request("POST", "/observations", body=body))
 
     def update_observation(
@@ -449,13 +456,19 @@ class EngramClient:
         )
 
     def passive_capture(
-        self, session_id: str, content: str, project: str = "", source: str = ""
+        self,
+        session_id: str,
+        content: str,
+        project: str = "",
+        source: str = "",
+        provenance: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """``POST /observations/passive`` → ``{extracted, saved, duplicates}`` (HTTP 200)."""
         body: dict[str, Any] = {"session_id": session_id, "content": content}
         for key, value in (("project", project), ("source", source)):
             if value.strip():
                 body[key] = value
+        _add_provenance(body, provenance)
         return _as_dict(self._request("POST", "/observations/passive", body=body))
 
     # -- Search and context --------------------------------------------------
@@ -523,7 +536,13 @@ class EngramClient:
 
     # -- Prompts, timeline, stats -------------------------------------------
 
-    def add_prompt(self, session_id: str, content: str, project: str = "") -> dict[str, Any] | None:
+    def add_prompt(
+        self,
+        session_id: str,
+        content: str,
+        project: str = "",
+        provenance: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         """``POST /prompts`` → ``{"id", "status"}``."""
         missing = [
             name
@@ -539,6 +558,7 @@ class EngramClient:
         body: dict[str, Any] = {"session_id": session_id, "content": content}
         if project.strip():
             body["project"] = project
+        _add_provenance(body, provenance)
         return _as_dict(self._request("POST", "/prompts", body=body))
 
     def timeline(
@@ -727,6 +747,16 @@ def _http_error_detail(exc: urllib.error.HTTPError, payload: dict[str, Any] | No
         if isinstance(message, str) and message:
             return f" {message}"
     return f" {exc.reason}" if exc.reason else ""
+
+
+def _add_provenance(body: dict[str, Any], provenance: dict[str, str] | None) -> None:
+    """Attach Engram 3.6 ``project_provenance`` to a capture body when given.
+
+    Accepted on ``POST /sessions``, ``/observations``, ``/observations/passive`` and
+    ``/prompts``; older servers decode these bodies leniently and ignore the key.
+    """
+    if isinstance(provenance, dict) and provenance:
+        body["project_provenance"] = dict(provenance)
 
 
 def _as_dict(payload: Any) -> dict[str, Any] | None:

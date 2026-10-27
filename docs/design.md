@@ -407,6 +407,25 @@ end does, so the next write registers again and, with `resume`, lands in a live
 continuation; that registration clears the finalized mark, so the continuation
 is ended normally later.
 
+## Capture project provenance
+
+Engram 3.6 accepts optional `project_provenance {source, directory}` evidence on
+`POST /sessions`, `/observations`, `/observations/passive` and `/prompts`
+(`docs/CAPTURE-PROJECT-PROVENANCE.md` upstream). recall sends it on every one of
+those writes, mirroring gentle-engram's `captureProjectProvenance`:
+
+- `source` is the `project_source` from `GET /project/current` when the write's
+  project is the detected project, `config` when `memory.recall.project` set it,
+  and `unknown` otherwise (a write to another project, or no detection).
+- A detected source outside Engram's accepted set is sent as `unknown`: Engram
+  400s an unsupported source, which would lose the whole write.
+- `directory` is the working directory the project was resolved from
+  (`TERMINAL_CWD`, else the process cwd).
+- Never sent on `POST /sessions/{id}/finalize`, whose body is strictly
+  `{project, summary}`, nor on `/end`. Older servers ignore the key.
+- `/project/current` has no `directory` parameter in 3.6.0; `cwd` is the
+  canonical one and is already used.
+
 ## `mem_update` ownership
 
 Engram v3 (`e8c0ce3`) requires `?expected_project=` on `PATCH /observations/{id}`:

@@ -139,7 +139,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 - [x] T13 S3 mem_consolidate. Route: inline.
 - [x] T14 S5 mem_session_finalize + end suppression. Route: inline.
 - [x] T15 S1 compact search (tool + prefetch). Route: inline.
-- [ ] T16 S6 capture provenance. Route: inline (own commit; writes data).
+- [x] T16 S6 capture provenance. Route: inline (own commit; writes data).
 - [ ] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
 - [ ] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
       v0.4.0, restart live Engram on 3.6.0, live `hermes plugins update recall`.
@@ -202,6 +202,13 @@ writers; done inline, test-first, in ~400-line commits.
   `review_after` and `relations` from the compact projection are not forwarded.
   The snippet comes from `content` (legacy), else `preview`; the client unwraps a
   compact answer whose `results` is not a list to `[]`.
+- L9 Decisions (T16, worker): provenance is `{source, directory}` only (no
+  `raw_project`, as S6 specifies). `directory` is omitted only when no working
+  directory can be read. The project override maps to `config` as S6 says; note
+  that Engram documents `config` as "derived from .engram/config.json", so
+  `explicit_override` would be the closer upstream term — left for T18 review.
+  The compaction archive and both capture tool saves carry it too; a non-string
+  `project_source` is treated as missing.
 
 ## Acceptance criteria
 
@@ -293,6 +300,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 - T13 mem_consolidate: `8d78676` (Pi gentle-ai-worker, test-first).
 - T14 mem_session_finalize + /end suppression: `2f7e74a` (Pi gentle-ai-worker,
   test-first).
+- T15 compact search: `f8da93e` (Pi gentle-ai-worker, test-first).
 
 ## Next step
 
