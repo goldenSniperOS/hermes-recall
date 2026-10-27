@@ -97,7 +97,7 @@ with a line such as:
 🧠 Recall · my-project — recalled 3 memories
 ```
 
-The model gets these tools (compact schemas, about 4 KB in total):
+The model gets these tools (compact schemas, about 5.5 KB in total):
 
 | Tool | Engram endpoint |
 |---|---|
@@ -112,6 +112,7 @@ The model gets these tools (compact schemas, about 4 KB in total):
 | `mem_pin`, `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` |
 | `mem_consolidate` | `POST /observations/consolidate` (Engram >= 3.5.1; preview, then confirm) |
 | `mem_judge_many` | `POST /conflicts/judge-many` (Engram >= 3.5.1) |
+| `mem_session_finalize` | `POST /sessions/{id}/finalize` (Engram >= 3.5.1) |
 
 Every write result carries a `status` such as `🧠 saved #761`, and the last
 memory id is kept in `<hermes_home>/recall/state.json`, so you can always get

@@ -137,7 +137,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 
 - [x] T12 S2+S4+S8 client error bodies, history, judge-many, refusal wording. Route: inline.
 - [x] T13 S3 mem_consolidate. Route: inline.
-- [ ] T14 S5 mem_session_finalize + end suppression. Route: inline.
+- [x] T14 S5 mem_session_finalize + end suppression. Route: inline.
 - [ ] T15 S1 compact search (tool + prefetch). Route: inline.
 - [ ] T16 S6 capture provenance. Route: inline (own commit; writes data).
 - [ ] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
@@ -185,6 +185,18 @@ writers; done inline, test-first, in ~400-line commits.
   additive value; `hermes_recall/state.py` lists the values in its docstring but
   was outside this worker's edit surface). A confirmation is "outcome unknown" on
   a timeout or any 5xx; a preview failure is reported like any other refusal.
+- L7 Decisions (T14, worker): `/end` is suppressed for a runtime session after a
+  finalize that ended it or may have (matching 200 receipt, timeout, 5xx, a 200
+  whose receipt does not match like gentle-engram's check, 409
+  `session_already_ended`); a definitive 400/403/404, a refused connection or an
+  older server keeps the normal `/end`. Each suppressing outcome forgets the
+  registration like an end, and the next validated registration (a continuation)
+  clears the mark so that continuation is ended later. A failed pre-registration
+  sends no finalize. `state.json` records the summary id as `session_summary`
+  (no new `last_action` value). A tool `mem_save` after a finalize still writes to
+  the runtime id without pre-registering, as after `on_session_end` since T11;
+  background writes pre-register and land in the continuation. Schema payload with
+  13 tools: 5564 bytes.
 
 ## Acceptance criteria
 
@@ -273,6 +285,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   for the owner's /restart; then Engram can move to v3 (brew stable is 2.2.0).
 - T12 history, mem_judge_many, refusal-aware errors: `bbc981f` (Pi gentle-ai-worker,
   test-first).
+- T13 mem_consolidate: `8d78676` (Pi gentle-ai-worker, test-first).
 
 ## Next step
 

@@ -36,6 +36,7 @@ EXPECTED_TOOLS = [
     "mem_unpin",
     "mem_consolidate",
     "mem_judge_many",
+    "mem_session_finalize",
 ]
 
 OBSERVATION = {
@@ -1133,6 +1134,229 @@ def test_mem_consolidate_on_an_older_engram_needs_3_5_1(
     assert "mem_consolidate needs Engram >= 3.5.1" in error
 
 
+# -- mem_session_finalize -----------------------------------------------------
+
+FINALIZE_PATH = f"/sessions/{SESSION}/finalize"
+FINALIZED = {
+    "session_id": SESSION,
+    "state": "finalized",
+    "summary_id": 950,
+    "summary_sync_id": "obs-950",
+    "already_finalized": False,
+    "judgment_required": False,
+}
+
+
+def paths(fake: FakeEngram) -> list[tuple[str, str]]:
+    return [(r.method, r.path) for r in fake.requests]
+
+
+def end_paths(fake: FakeEngram) -> list[str]:
+    return [r.path for r in fake.requests if r.path.endswith("/end")]
+
+
+def finish(provider: RecallProvider) -> None:
+    """The host's shutdown: end the session, then drain the worker."""
+    provider.on_session_end([])
+    assert provider._drain_for_test()
+
+
+def test_mem_session_finalize_request_result_state_and_no_end(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", FINALIZE_PATH, (200, FINALIZED))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_session_finalize", summary="## Goal\nship <private>key</private>")
+
+    # Registered at initialize, so nothing but the finalize itself; the body is
+    # exactly {project, summary}: Engram refuses any other key.
+    assert paths(fake_engram) == [("POST", FINALIZE_PATH)]
+    assert only(fake_engram, "POST", FINALIZE_PATH).json_body == {
+        "project": PROJECT,
+        "summary": "## Goal\nship [REDACTED]",
+    }
+    assert result["id"] == 950
+    assert result["state"] == "finalized"
+    assert result["status"] == "🧠 session finalized, summary #950"
+    state = read_state(tmp_path)
+    assert (state["last_memory_id"], state["last_action"]) == (950, "session_summary")
+
+    finish(provider)
+    provider.on_session_switch("sess-2", reset=True)
+    assert provider._drain_for_test()
+    assert end_paths(fake_engram) == []
+
+
+def test_mem_session_finalize_already_finalized_also_suppresses_the_end(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    again = {**FINALIZED, "state": "already_finalized", "already_finalized": True}
+    fake_engram.route("POST", FINALIZE_PATH, (200, again))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_session_finalize", summary="done")
+
+    assert result["status"] == "🧠 session already finalized, summary #950"
+    finish(provider)
+    assert end_paths(fake_engram) == []
+
+
+def test_mem_session_finalize_registers_the_session_first(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/sessions", (500, {"error": "database is locked"}))
+    fake_engram.route("POST", FINALIZE_PATH, (200, FINALIZED))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.route("POST", "/sessions", echo_session)
+    fake_engram.reset()
+
+    call(provider, "mem_session_finalize", summary="done")
+
+    assert paths(fake_engram) == [("POST", "/sessions"), ("POST", FINALIZE_PATH)]
+
+
+def test_mem_session_finalize_is_not_sent_when_registration_fails(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", "/sessions", (500, {"error": "database is locked"}))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    error = call(provider, "mem_session_finalize", summary="done")["error"]
+
+    assert "database is locked" in error
+    assert paths(fake_engram) == [("POST", "/sessions")]
+
+
+def test_a_write_after_finalize_registers_a_continuation_and_its_end_is_posted(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", FINALIZE_PATH, (200, FINALIZED))
+    fake_engram.route("POST", "/prompts", (201, {"id": 1, "status": "saved"}))
+    provider = make_provider(fake_engram.base_url)
+    continuation = f"{SESSION}:resume:2"
+    fake_engram.route("POST", "/sessions", (201, {"id": continuation, "status": "created"}))
+    call(provider, "mem_session_finalize", summary="done")
+    fake_engram.reset()
+
+    provider.on_turn_start(2, "one more question after the summary")
+    finish(provider)
+
+    assert only(fake_engram, "POST", "/sessions").json_body["resume"] is True
+    assert only(fake_engram, "POST", "/prompts").json_body["session_id"] == continuation
+    # The continuation is live, so its end is posted (the id is path-quoted).
+    assert end_paths(fake_engram) == [f"/sessions/{SESSION}%3Aresume%3A2/end"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (500, {"error": "session finalization failed", "code": "session_finalize_failed"}),
+        (200, {**FINALIZED, "state": "pending"}),
+        (200, {**FINALIZED, "session_id": "someone-else"}),
+        Delay(1.0, (200, FINALIZED)),
+    ],
+)
+def test_an_uncertain_finalize_is_never_retried_nor_followed_by_an_end(
+    fake_engram: FakeEngram, make_provider: Any, tmp_path: Path, monkeypatch: Any, answer: Any
+) -> None:
+    from hermes_recall import client as client_module
+
+    wire(fake_engram)
+    fake_engram.route("POST", FINALIZE_PATH, answer)
+    provider = make_provider(fake_engram.base_url)
+    monkeypatch.setattr(client_module, "WRITE_TIMEOUT_S", 0.2)
+    fake_engram.reset()
+
+    error = call(provider, "mem_session_finalize", summary="done")["error"]
+
+    assert "outcome is unknown" in error
+    assert "do not retry" in error
+    assert paths(fake_engram) == [("POST", FINALIZE_PATH)]
+    assert not state_path(tmp_path).exists()
+    finish(provider)
+    assert end_paths(fake_engram) == []
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "end_posted"),
+    [
+        (403, "session_project_mismatch", True),
+        (404, "unknown_session", True),
+        (400, "invalid_arguments", True),
+        # Already ended by someone else: another /end would be redundant.
+        (409, "session_already_ended", False),
+    ],
+)
+def test_a_refused_finalize_reports_engrams_code(
+    fake_engram: FakeEngram,
+    make_provider: Any,
+    tmp_path: Path,
+    status: int,
+    code: str,
+    end_posted: bool,
+) -> None:
+    wire(fake_engram)
+    fake_engram.route(
+        "POST", FINALIZE_PATH, (status, {"error": "refused", "code": code, "session_id": SESSION})
+    )
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    result = call(provider, "mem_session_finalize", summary="done", project="other")
+
+    assert only(fake_engram, "POST", FINALIZE_PATH).json_body == {
+        "project": "other",
+        "summary": "done",
+    }
+    assert result["code"] == code
+    assert f"HTTP {status} refused" in result["error"]
+    assert "engram serve" not in result["error"]
+    assert paths(fake_engram) == [("POST", FINALIZE_PATH)]
+    assert not state_path(tmp_path).exists()
+    finish(provider)
+    assert end_paths(fake_engram) == ([f"/sessions/{SESSION}/end"] if end_posted else [])
+
+
+@pytest.mark.parametrize(
+    "older",
+    [Malformed(404, b"404 page not found\n"), Malformed(405, b"Method Not Allowed\n")],
+)
+def test_mem_session_finalize_on_an_older_engram_needs_3_5_1_and_keeps_the_end(
+    fake_engram: FakeEngram, make_provider: Any, older: Malformed
+) -> None:
+    wire(fake_engram)
+    fake_engram.route("POST", FINALIZE_PATH, older)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    error = call(provider, "mem_session_finalize", summary="done")["error"]
+
+    assert "mem_session_finalize needs Engram >= 3.5.1" in error
+    finish(provider)
+    assert end_paths(fake_engram) == [f"/sessions/{SESSION}/end"]
+
+
+def test_mem_session_finalize_requires_a_summary(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    assert "summary" in call(provider, "mem_session_finalize")["error"]
+    assert "summary" in call(provider, "mem_session_finalize", summary="  ")["error"]
+    assert fake_engram.requests == []
+
+
 # -- server refusals are not outages (S8) --------------------------------------
 
 
@@ -1223,6 +1447,7 @@ def test_mem_pin_missing_observation_is_an_error(
         ("mem_unpin", {"id": 761}),
         ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
         ("mem_consolidate", CONSOLIDATE_ARGS),
+        ("mem_session_finalize", {"summary": "done"}),
     ],
 )
 def test_non_primary_write_tools_are_refused(
@@ -1271,6 +1496,7 @@ def test_non_primary_read_tools_still_work(fake_engram: FakeEngram, make_provide
         ("mem_unpin", {"id": 761}),
         ("mem_judge_many", {"judgments": [{"judgment_id": "r", "relation": "related"}]}),
         ("mem_consolidate", CONSOLIDATE_ARGS),
+        ("mem_session_finalize", {"summary": "done", "project": "p"}),
     ],
 )
 def test_engram_down_is_a_json_error_never_a_raise(

@@ -762,6 +762,30 @@ def test_consolidate_confirm_without_fingerprint_makes_no_request(
     assert fake_engram.requests == []
 
 
+def test_finalize_session_posts_exactly_project_and_summary(fake_engram: FakeEngram) -> None:
+    receipt = {"session_id": "a/b", "state": "finalized", "summary_id": 9}
+    fake_engram.route("POST", "/sessions/a%2Fb/finalize", (200, receipt))
+
+    result = client_for(fake_engram).finalize_session("a/b", "proj", "## Goal")
+
+    assert result == receipt
+    request = fake_engram.find("POST", "/sessions/a%2Fb/finalize")
+    assert request is not None
+    # Engram refuses any other key on this route.
+    assert request.json_body == {"project": "proj", "summary": "## Goal"}
+
+
+@pytest.mark.parametrize("blank", [("", "p", "s"), ("id", " ", "s"), ("id", "p", "\n")])
+def test_finalize_session_with_a_blank_field_makes_no_request(
+    fake_engram: FakeEngram, blank: tuple[str, str, str]
+) -> None:
+    client = client_for(fake_engram)
+
+    assert client.finalize_session(*blank) is None
+    assert "refused locally" in client.last_error_text()
+    assert fake_engram.requests == []
+
+
 # -- 12. fail-soft sweep ------------------------------------------------------
 
 # Every public endpoint method, with arguments good enough to reach the network.
@@ -787,6 +811,7 @@ SWEEP_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
     "judge_conflict": (("rel-1", "related"), {}),
     "judge_many": (([{"judgment_id": "rel-1", "relation": "related"}],), {}),
     "consolidate": (([11, 12], "T", "C", "proj"), {}),
+    "finalize_session": (("sess-1", "proj", "summary"), {}),
     "pin_observation": ((761,), {}),
     "unpin_observation": ((761,), {}),
 }

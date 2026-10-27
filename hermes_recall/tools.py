@@ -218,6 +218,12 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         {"judgments": {"type": "array", "items": {"type": "object"}}},
         ["judgments"],
     ),
+    _schema(
+        "mem_session_finalize",
+        "Save the final session summary and end the session in one step.",
+        {"summary": _STR, "project": _PROJECT},
+        ["summary"],
+    ),
 )
 
 TOOL_NAMES: frozenset[str] = frozenset(schema["name"] for schema in _TOOL_SCHEMAS)
@@ -231,6 +237,7 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "mem_unpin",
         "mem_consolidate",
         "mem_judge_many",
+        "mem_session_finalize",
     }
 )
 
@@ -263,6 +270,12 @@ class ToolEnv:
     # the registration's acknowledged id is the one to write under. ``None`` (no
     # resolver) means the runtime id itself.
     effective_session_id: Callable[[], str] | None = None
+    # Registers the session unless Engram already confirmed it; ``None`` means
+    # "register unconditionally" through ``register_session``.
+    ensure_registered: Callable[[str], bool] | None = None
+    # Told the effective session id once a finalize ended it (or may have), so the
+    # provider does not post ``/end`` for it and re-registers before the next write.
+    session_finalized: Callable[[str], None] | None = None
 
     def write_session_id(self) -> str:
         """The session id to attribute a write to right now."""
@@ -909,6 +922,68 @@ def _consolidation_error(env: ToolEnv, confirm: bool) -> ToolError:
     return _workflow_error(env, "mem_consolidate", "consolidation")
 
 
+def _finalize_receipt_ok(receipt: dict[str, Any], session_id: str) -> bool:
+    """Whether a 200 is a matching receipt (as gentle-engram checks it)."""
+    state = receipt.get("state")
+    summary_id = _observation_id({"id": receipt.get("summary_id")})
+    return (
+        receipt.get("session_id") == session_id
+        and state in ("finalized", "already_finalized")
+        and summary_id is not None
+        and summary_id > 0
+    )
+
+
+def _mem_session_finalize(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
+    """POST /sessions/{effective id}/finalize: summary and end in one transaction.
+
+    Sent once, never retried and never followed by a fallback ``/end``. Every
+    outcome that ended the session or may have (success, ``already_finalized``, a
+    timeout, a 5xx, a non-matching receipt, 409 ``session_already_ended``) is
+    reported to the provider, which then skips its own ``/end``. A definitive
+    refusal changed nothing, so the session stays open and is ended as usual.
+    """
+    if not env.session_id:
+        raise ToolError("no active Hermes session to finalize")
+    summary = strip_private(_str_arg(args, "summary", required=True))
+    project = _project(env, args)
+    if not project:
+        raise ToolError("no project detected: pass 'project'")
+    ensure = env.ensure_registered or env.register_session
+    if not ensure(project):
+        raise _engram_error(env, "session registration")
+    session_id = env.write_session_id()
+    client = env.client
+    receipt = client.finalize_session(session_id, project, summary)
+    if receipt is not None and _finalize_receipt_ok(receipt, session_id):
+        _finalized(env, session_id)
+        summary_id = _observation_id({"id": receipt.get("summary_id")})
+        _remember(env, summary_id, "session_summary", project)
+        already = receipt.get("state") == "already_finalized"
+        label = "session already finalized" if already else "session finalized"
+        return {**receipt, "id": summary_id, "status": f"🧠 {label}, summary #{summary_id}"}
+    status = client.last_error_status
+    uncertain = receipt is not None or (
+        TIMEOUT_ERROR_MARKER in client.last_error_text() if status is None else status >= 500
+    )
+    if uncertain:
+        _finalized(env, session_id)
+        reason = client.last_error_text() or "the receipt did not match this session"
+        raise ToolError(
+            f"Session finalization outcome is unknown ({reason}): do not retry, and do "
+            "not save the summary again before checking mem_context.",
+            **_refusal_fields(client),
+        )
+    if (getattr(client, "last_error_body", None) or {}).get("code") == "session_already_ended":
+        _finalized(env, session_id)
+    raise _workflow_error(env, "mem_session_finalize", "finalization")
+
+
+def _finalized(env: ToolEnv, session_id: str) -> None:
+    if env.session_finalized is not None:
+        env.session_finalized(session_id)
+
+
 def _pin_handler(pinned: bool) -> Callable[[ToolEnv, dict[str, Any]], dict[str, Any]]:
     def handler(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
         observation_id = _id_arg(args, "id")
@@ -936,6 +1011,7 @@ _HANDLERS: dict[str, Callable[[ToolEnv, dict[str, Any]], Any]] = {
     "mem_unpin": _pin_handler(False),
     "mem_consolidate": _mem_consolidate,
     "mem_judge_many": _mem_judge_many,
+    "mem_session_finalize": _mem_session_finalize,
 }
 
 # -- Human status (``/recall`` and ``hermes recall status``) ---------------------

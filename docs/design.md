@@ -38,7 +38,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `sync_turn` | `POST /observations/passive` | Tool results + assistant text, ≤ 12 per turn; skips `mem_*`, `mcp__engram__*`, `mcp_engram_*` results |
 | `on_delegation` | `POST /observations/passive` (`source=subagent`) | Task / result redacted, then capped at 1000 / 4000 chars |
 | `on_pre_compress` | `POST /observations` (`session_summary`), `GET /context/compaction` | Synchronous, 7 s budget, idempotent by hash |
-| `on_session_switch` / `on_session_end` | `POST /sessions` (`resume: true`), `POST /sessions/{id}/end` | `/end` de-duplicated; ends the effective session id |
+| `on_session_switch` / `on_session_end` | `POST /sessions` (`resume: true`), `POST /sessions/{id}/end` | `/end` de-duplicated; ends the effective session id; skipped after `mem_session_finalize` |
 | `mem_search` | `GET /search` | Default project = detected project |
 | `mem_save` | `POST /observations` | Registers the session and retries once on `session not found` |
 | `mem_update` | `PATCH /observations/{id}?expected_project=` | `expected_project` required, never defaulted; only given fields are sent |
@@ -49,6 +49,7 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `mem_judge` | `POST /conflicts/judge` | `relation` ∈ related, compatible, scoped, conflicts_with, supersedes, not_conflict |
 | `mem_pin` / `mem_unpin` | `PUT` / `DELETE /observations/{id}/pin` | |
 | `mem_consolidate` | `POST /observations/consolidate` | Preview without `confirm`; apply with `confirm` + the approved plan's `fingerprint`; `expected_project` required; title/content redacted; never retried, never auto-confirmed |
+| `mem_session_finalize` | `POST /sessions/{effective id}/finalize` | Body exactly `{project, summary}`; registers first; sent once; see "Session finalize" |
 | `mem_judge_many` | `POST /conflicts/judge-many` | 1..32 judgments, each validated like `mem_judge` before anything is sent; effective session id; never retried |
 | `/recall`, `hermes recall status` | `GET /health` | Plus `state.json` |
 | `/recall <id>`, `hermes recall show <id>` | `GET /observations/{id}` | |
@@ -79,6 +80,7 @@ Results that carry an observation id include a `status` field:
 | `mem_unpin` | `🧠 unpinned #761` | `unpinned` |
 | `mem_judge` | `🧠 judged <judgment_id>: <relation>` | — |
 | `mem_judge_many` | `🧠 judged 3 of 4 (1 failed)` | — |
+| `mem_session_finalize` | `🧠 session finalized, summary #950` | `session_summary` |
 | `mem_consolidate` (preview) | `🧠 consolidation preview: 2 observations into 1` | — |
 | `mem_consolidate` (confirm) | `🧠 consolidated #30 (soft-deleted #11, #12)` | `consolidated` |
 
@@ -236,8 +238,8 @@ Other plugins depend on this file (hermes-odd reads `last_memory_id`). It is a
 - **Atomicity:** written to a temp file in the same directory, `fsync`ed, then
   `os.replace`d over the target. Readers never see a partial file.
 - **When:** after every successful `mem_save`, `mem_session_summary`,
-  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin` and confirmed
-  `mem_consolidate` (the survivor id) in the primary agent context. Write failures
+  `mem_update`, `mem_get_observation`, `mem_pin`, `mem_unpin`, confirmed
+  `mem_consolidate` (the survivor id) and `mem_session_finalize` (the summary id) in the primary agent context. Write failures
   are swallowed; the tool result is unaffected.
 - **API:**
 
@@ -332,9 +334,9 @@ not `hermes recall`.
   thread cannot overwrite each other's failure reason.
 - Non-primary `agent_context` (`subagent`, `cron`, `flush`): no capture and no
   session writes; write tools (`mem_save`, `mem_update`, `mem_session_summary`,
-  `mem_judge`, `mem_judge_many`, `mem_consolidate`, `mem_pin`, `mem_unpin`) return
-  an error. Read tools work and do not
-  write `state.json`.
+  `mem_judge`, `mem_judge_many`, `mem_consolidate`, `mem_session_finalize`,
+  `mem_pin`, `mem_unpin`) return an error. Read tools work and do not write
+  `state.json`.
 
 ## Session registration
 
@@ -385,6 +387,25 @@ id; v2.2 answers 409 `session_already_ended`, which stays a failed registration.
   second `/end` for A. This is intentional and harmless: 2.0.0's `EndSession` just
   re-runs its `UPDATE`, answering 200 and moving `ended_at` to the second end (the
   summary stays empty, as both ends send one).
+
+### Session finalize
+
+`mem_session_finalize` (Engram >= 3.5.1) saves the summary and ends the session in
+one transaction: `POST /sessions/{effective id}/finalize` with exactly
+`{project, summary}`. An unconfirmed session is registered first; if that fails,
+nothing is posted. The request is sent once:
+
+| Outcome | Tool result | Shutdown / reset `/end` |
+| --- | --- | --- |
+| 200 `finalized` / `already_finalized` with a matching receipt | `🧠 session finalized, summary #<id>` | Not posted |
+| Timeout, 5xx, or a 200 whose receipt does not match | "outcome is unknown: do not retry" | Not posted (no fallback) |
+| 409 `session_already_ended` | Error with the code | Not posted |
+| 400 / 403 `session_project_mismatch` / 404 `unknown_session`, refused connection, older server | Error with the code (or "needs Engram >= 3.5.1") | Posted as usual |
+
+Every "not posted" outcome also forgets the session's registration, exactly as an
+end does, so the next write registers again and, with `resume`, lands in a live
+continuation; that registration clears the finalized mark, so the continuation
+is ended normally later.
 
 ## `mem_update` ownership
 

@@ -52,3 +52,4 @@ provides_tools:
   - mem_unpin
   - mem_consolidate
   - mem_judge_many
+  - mem_session_finalize

@@ -118,7 +118,7 @@ def test_manifest_provides_tools_matches_the_tool_schemas() -> None:
             break
         listed.append(item.group(1))
     assert listed == [schema["name"] for schema in get_tool_schemas()]
-    assert len(listed) == 12
+    assert len(listed) == 13
 
 
 def test_root_cli_exposes_the_loader_hooks() -> None:

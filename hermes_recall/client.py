@@ -284,6 +284,40 @@ class EngramClient:
         quoted = urllib.parse.quote(session_id, safe="")
         return _as_dict(self._request("POST", f"/sessions/{quoted}/end", body={"summary": summary}))
 
+    def finalize_session(
+        self, session_id: str, project: str, summary: str
+    ) -> dict[str, Any] | None:
+        """``POST /sessions/{id}/finalize`` → the finalization receipt (Engram 3.6).
+
+        Saves ``summary`` as the session's summary and ends the session in one
+        transaction: ``{session_id, state, summary_id, summary_sync_id,
+        already_finalized, judgment_required}``. The body is exactly ``{project,
+        summary}`` — the server refuses any other key — and both must be non-blank.
+        """
+        missing = [
+            name
+            for name, value in (
+                ("session_id", session_id),
+                ("project", project),
+                ("summary", summary),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            self._record_error(
+                "POST /sessions/{id}/finalize: refused locally, blank required field(s): "
+                + ", ".join(missing)
+            )
+            return None
+        quoted = urllib.parse.quote(session_id, safe="")
+        return _as_dict(
+            self._request(
+                "POST",
+                f"/sessions/{quoted}/finalize",
+                body={"project": project, "summary": summary},
+            )
+        )
+
     # -- Observations --------------------------------------------------------
 
     def add_observation(

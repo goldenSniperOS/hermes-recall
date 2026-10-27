@@ -237,6 +237,11 @@ class RecallProvider(MemoryProvider):
         # switches for exactly those queued jobs. Dropped when the session is ended,
         # so the next registration asks the server again. Bounded, insertion-ordered.
         self._effective_sessions: dict[str, str] = {}
+        # Runtime session ids whose Engram session a ``mem_session_finalize`` ended (or
+        # may have ended): their ``/end`` is not posted. Cleared for a runtime id by
+        # its next validated registration, which yields a live continuation that
+        # does need ending. Bounded, insertion-ordered.
+        self._finalized_sessions: dict[str, None] = {}
 
         # Capture state, per session.
         self._turn_number: int = 0
@@ -1069,10 +1074,7 @@ class RecallProvider(MemoryProvider):
             # has picked the end job up.
             self._remember_ended_session(session_id)
 
-            def job() -> None:
-                self._client.end_session(self._close_effective_session(session_id), summary="")
-
-            self._submit("session-end", job)
+            self._submit("session-end", lambda: self._end_session_job(session_id))
         except Exception:
             logger.debug("recall on_session_end failed (non-fatal)", exc_info=True)
 
@@ -1148,11 +1150,32 @@ class RecallProvider(MemoryProvider):
             return
 
         self._remember_ended_session(previous_session_id)
+        self._submit("session-end", lambda: self._end_session_job(previous_session_id))
 
-        def job() -> None:
-            self._client.end_session(self._close_effective_session(previous_session_id), summary="")
+    def _end_session_job(self, runtime_id: str) -> None:
+        """Post ``/end`` for ``runtime_id``'s effective session (worker thread).
 
-        self._submit("session-end", job)
+        Skipped when a ``mem_session_finalize`` already ended that session, or may
+        have: finalize is the session's end, and a fallback ``/end`` after an
+        uncertain finalize could race a commit the server already made.
+        """
+        effective = self._close_effective_session(runtime_id)
+        if runtime_id in self._finalized_sessions:
+            logger.debug("recall: session %s was finalized; not posting /end", effective)
+            return
+        self._client.end_session(effective, summary="")
+
+    def _session_finalized(self, runtime_id: str) -> None:
+        """Record that ``mem_session_finalize`` ended (or may have ended) the session.
+
+        Its registration is forgotten like an end's, so the next write registers
+        again and, with ``resume``, lands in a continuation.
+        """
+        self._close_effective_session(runtime_id)
+        self._finalized_sessions.pop(runtime_id, None)
+        self._finalized_sessions[runtime_id] = None
+        while len(self._finalized_sessions) > _ENDED_SESSION_MEMORY:
+            self._finalized_sessions.pop(next(iter(self._finalized_sessions)))
 
     def _remember_ended_session(self, session_id: str) -> None:
         """Note that a session's ``/end`` has been issued, keeping the set bounded."""
@@ -1341,6 +1364,11 @@ class RecallProvider(MemoryProvider):
                     project, session_id=runtime_id
                 ),
                 effective_session_id=lambda: self._effective_session_id(runtime_id),
+                ensure_registered=lambda project: (
+                    runtime_id == self._registered_session_id
+                    or self._register_session_now(project, session_id=runtime_id)
+                ),
+                session_finalized=lambda _effective: self._session_finalized(runtime_id),
             )
             return tools_module.handle_tool_call(env, tool_name, args)
         except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
@@ -1379,6 +1407,8 @@ class RecallProvider(MemoryProvider):
             logger.debug("recall: session %s resumes as %s", target_session, effective)
         self._effective_sessions.pop(target_session, None)
         self._effective_sessions[target_session] = effective
+        # A live registration after a finalize: this session needs its /end again.
+        self._finalized_sessions.pop(target_session, None)
         while len(self._effective_sessions) > _EFFECTIVE_SESSION_MEMORY:
             self._effective_sessions.pop(next(iter(self._effective_sessions)))
         if target_session == self._session_id:
