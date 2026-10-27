@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-recall"
-version = "0.3.0"
+version = "0.4.0"
 description = "Hermes Agent memory provider: Engram-compatible recall, capture and session lifecycle."
 readme = "README.md"
 requires-python = ">=3.11"

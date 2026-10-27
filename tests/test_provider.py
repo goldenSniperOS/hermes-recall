@@ -353,8 +353,9 @@ def test_reset_project_cache_forces_re_detection(
 
 def test_system_prompt_block_fits_the_budget() -> None:
     # Hard ceiling: this block ships on every API call, so it is budgeted, not
-    # "kept short". Currently 1235 chars.
-    assert 0 < len(SYSTEM_PROMPT_BLOCK) <= 1500, len(SYSTEM_PROMPT_BLOCK)
+    # "kept short". 1235 chars until v0.4.0 added the canonical topic workflow,
+    # the empty-search retry and the Engram 3.6 tools.
+    assert 0 < len(SYSTEM_PROMPT_BLOCK) <= 2600, len(SYSTEM_PROMPT_BLOCK)
 
 
 def test_system_prompt_block_is_byte_identical_across_calls() -> None:
@@ -393,6 +394,37 @@ def test_system_prompt_block_covers_the_contract() -> None:
         assert section in block, section
     for field_name in ("**title**", "**type**", "**scope**"):
         assert field_name in block, field_name
+
+
+def test_system_prompt_block_carries_the_canonical_topic_workflow() -> None:
+    # gentle-engram's CANONICAL TOPIC WORKFLOW (plugin/pi/index.ts), condensed.
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "evolving topic" in block
+    assert "Search first" in block
+    assert "`mem_get_observation`" in block
+    assert "`mem_update` it by id with `expected_project`" in block
+    assert "`mem_save` with a distinct `topic_key`" in block
+    assert "write nothing" in block
+    assert "Never merge across projects" in block
+    # The workflow comes before the shape of a save, as it decides whether to save.
+    assert block.index("evolving topic") < block.index("Shape of a save")
+
+
+def test_system_prompt_block_retries_an_empty_scoped_search_broadly() -> None:
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert 'retry once with `match_mode: "any"` and `all_projects: true`' in block
+
+
+def test_system_prompt_block_names_the_engram_3_6_tools() -> None:
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "`mem_consolidate`" in block
+    assert "`fingerprint`" in block
+    assert "Never auto-confirm" in block
+    assert "`mem_judge_many`" in block
+    assert "`mem_session_finalize`" in block
 
 
 def test_system_prompt_block_emits_no_memory_context_tags() -> None:

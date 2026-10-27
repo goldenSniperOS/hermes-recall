@@ -177,9 +177,18 @@ to orient yourself.
 
 ### Saving (do this; do not wait to be asked)
 
-Call `mem_save` immediately after: a bug fix, an architecture or design decision,
-a non-obvious discovery about the codebase, a configuration or environment change,
-a pattern or convention established, or a user preference or constraint you learned.
+Persist a learning right after: a bug fix (with its root cause), an architecture
+or design decision, a non-obvious discovery about the codebase, a configuration or
+environment change, a pattern or convention established, or a user preference or
+constraint you learned.
+
+A memory is an evolving topic, not a log entry:
+- Search first: `mem_search` the subject in the intended project and scope.
+- Read plausible hits in full with `mem_get_observation`; snippets are not enough.
+- Same topic? `mem_update` it by id with `expected_project` (its owner), keeping
+  its `topic_key` and every still-valid fact.
+- New topic? `mem_save` with a distinct `topic_key`. Already covered? write nothing.
+- Never merge across projects or scopes; a similar title is not proof of identity.
 
 Shape of a save:
 - **title**: verb + what — short and searchable
@@ -195,11 +204,23 @@ Shape of a save:
 
 Use `mem_search` or `mem_context` only when the user asks you to recall past work,
 or when the injected block is not enough — not to re-fetch what you already have.
+`mem_search` is scoped to the current project. When it finds nothing, you must
+retry once with `match_mode: "any"` and `all_projects: true` before concluding
+that no memory exists.
+
+### Maintenance
+
+- `mem_consolidate` merges duplicates of one topic: preview first, show the plan
+  to the user, and confirm with its `fingerprint` only after they approve it.
+  Never auto-confirm, and never retry an uncertain confirmation.
+- `mem_judge_many` resolves several conflict candidates in one call.
 
 ### Closing
 
 Before saying the work is done, call `mem_session_summary` with Goal, Discoveries,
-Accomplished, Next Steps and Relevant Files."""
+Accomplished, Next Steps and Relevant Files. When the user closes or hands off the
+session, call `mem_session_finalize` with that summary instead: it saves it and
+ends the session in one step."""
 
 
 @dataclass(frozen=True)

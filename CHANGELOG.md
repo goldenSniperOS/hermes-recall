@@ -6,6 +6,47 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
+Engram 3.6.0 additions (gentle-engram 0.5 parity). Every new route degrades on
+older servers: earlier Engram versions keep working, and a new tool on a server
+without its route answers "needs Engram >= 3.5.1" instead of failing.
+
+### Added
+
+- `mem_consolidate`: merge duplicate observations through
+  `POST /observations/consolidate`. A preview writes nothing and returns the
+  plan with its fingerprint for the user to approve; `confirm` with that
+  fingerprint applies it. A changed plan (409 `fingerprint_mismatch`) comes back
+  as a fresh plan and is never confirmed automatically; a confirmation that
+  timed out or failed server-side is reported as unknown and never retried.
+- `mem_judge_many`: resolve up to 32 conflict candidates in one
+  `POST /conflicts/judge-many`, each validated like `mem_judge`, never retried.
+- `mem_session_finalize`: save the final summary and end the session in one
+  `POST /sessions/{id}/finalize`. After it, the shutdown or reset `/end` is not
+  posted, also when the outcome is uncertain; a later write lands in a resumed
+  continuation.
+- `mem_get_observation` takes `include_history` and `history_cursor` and returns
+  the observation's prior versions (each capped), `version_count` and the next
+  page cursor.
+- Capture writes (`/sessions`, `/observations`, `/observations/passive`,
+  `/prompts`) carry `project_provenance {source, directory}`: Engram's detected
+  `project_source`, `config` for `memory.recall.project`, else `unknown`.
+
+### Changed
+
+- `mem_search` and the per-turn recall ask for `response_format=compact`: hits
+  render from the bounded `preview` and `mem_search` marks pinned hits. The
+  legacy full answer of older servers is still accepted.
+- A tool error from a server that answered (for example 404 `unknown_project`
+  or 409 `ambiguous_project`) reports Engram's reason, `code` and
+  `available_projects` instead of asking whether `engram serve` is running.
+- The system prompt follows gentle-engram's canonical topic workflow (search,
+  read in full, update the same topic by id with `expected_project`, save a new
+  topic with a distinct `topic_key`, never merge across projects), retries an
+  empty scoped search across all projects, and names the new tools.
+- The tool set grows from 10 to 13 schemas (about 5.5 KB).
+
 ## [0.3.0] - 2026-10-02
 
 Compatibility with Engram v3.0.0 (and gentle-engram 0.2.0). Engram 2.0.0

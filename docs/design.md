@@ -100,6 +100,28 @@ automatically. A confirmation that timed out or got a 5xx may have been applied,
 so the error says the outcome is unknown and asks the model to check the source
 ids instead of retrying.
 
+## System prompt (static)
+
+`provider.SYSTEM_PROMPT_BLOCK` is a module constant, byte-stable for the process
+(Hermes caches the assembled prompt prefix), with no digits, ids or project names.
+It is budgeted at 2600 characters (`test_system_prompt_block_fits_the_budget`).
+Since 0.4.0 it follows gentle-engram's protocol (`plugin/pi/index.ts`):
+
+- **Canonical topic workflow:** search first, read plausible hits in full with
+  `mem_get_observation`, update the same topic by id with `expected_project`
+  (keeping its `topic_key`), save a genuinely new topic with a distinct
+  `topic_key`, write nothing when it is covered, never merge across projects.
+- **Empty scoped search:** retry once with `match_mode: "any"` and
+  `all_projects: true` before concluding nothing exists.
+- **Engram 3.6 tools:** `mem_consolidate` (preview, user approval, confirm with
+  the fingerprint, never auto-confirm), `mem_judge_many`, and
+  `mem_session_finalize` when the user closes or hands off the session.
+
+Compaction recovery is not in this block, by design: the outcome-specific
+instruction travels in `on_pre_compress`'s return value (see "Hooks and tools"),
+which is what upstream means by keeping compaction recovery outside the system
+prompt.
+
 ## Engram server lifecycle
 
 Ported from gentle-engram's `initializeEngramServer` (`index.ts`), so Hermes and Pi
@@ -472,6 +494,7 @@ nothing of it is skipped. A rewind keeps the mark.
 | Recall block | 2500 chars (200..20000) | `memory.recall.recall_max_chars` |
 | Prompt capture | > 10, ≤ 2000 chars | `provider.PROMPT_*` |
 | Passive captures per turn | 12, each > 50 chars | `provider.PASSIVE_*` |
+| System prompt block | 2600 chars | `provider.SYSTEM_PROMPT_BLOCK` |
 | Compaction digest / recovery text | 4000 / 1500 chars | `provider.PRE_COMPRESS_MAX_CHARS`, `RECOVERY_MAX_CHARS` |
 | `mem_search` limit | 10 default, 20 max | `tools.SEARCH_LIMIT_*` |
 | `mem_search` query / snippet | 500 / 300 chars | `tools.QUERY_MAX_CHARS`, `SEARCH_SNIPPET_MAX_CHARS` |

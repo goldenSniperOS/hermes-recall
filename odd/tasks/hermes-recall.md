@@ -140,7 +140,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 - [x] T14 S5 mem_session_finalize + end suppression. Route: inline.
 - [x] T15 S1 compact search (tool + prefetch). Route: inline.
 - [x] T16 S6 capture provenance. Route: inline (own commit; writes data).
-- [ ] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
+- [x] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
 - [ ] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
       v0.4.0, restart live Engram on 3.6.0, live `hermes plugins update recall`.
 
@@ -209,6 +209,12 @@ writers; done inline, test-first, in ~400-line commits.
   `explicit_override` would be the closer upstream term — left for T18 review.
   The compaction archive and both capture tool saves carry it too; a non-string
   `project_source` is treated as missing.
+- L10 Decisions (T17, worker): the static system prompt grows from 1235 to about
+  2400 chars, so its budget test moves from 1500 to 2600. The workflow is written
+  as bullets, not numbered steps, because the block must carry no digits (prompt
+  cache guard). `mem_session_finalize` is suggested only when the user closes or
+  hands off the session; ordinary completion still uses `mem_session_summary`.
+  README keeps "tested with 2.0.0 and 3.0.0" until T18's live 3.6.0 smoke.
 
 ## Acceptance criteria
 
@@ -301,6 +307,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 - T14 mem_session_finalize + /end suppression: `2f7e74a` (Pi gentle-ai-worker,
   test-first).
 - T15 compact search: `f8da93e` (Pi gentle-ai-worker, test-first).
+- T16 capture provenance: `1b6c910` (Pi gentle-ai-worker, test-first, own commit).
 
 ## Next step
 
