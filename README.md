@@ -49,7 +49,7 @@ way around.
   brew install gentleman-programming/tap/engram
   ```
 
-  Tested with Engram 2.0.0 and 3.0.0. `mem_consolidate`, `mem_judge_many`,
+  Tested with Engram 2.0.0, 3.0.0 and 3.6.0. `mem_consolidate`, `mem_judge_many`,
   `mem_session_finalize`, observation history and compact search need Engram
   >= 3.5.1; on an older server those tools say so and everything else keeps
   working. You no longer need to start `engram serve` by hand: when no server answers, hermes-recall starts one for you (see
