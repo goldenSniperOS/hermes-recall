@@ -232,6 +232,11 @@ writers; done inline, test-first, in ~400-line commits.
   Slices are the per-task commits bbc981f..95f224a (~2400 authored lines, ~55% tests);
   each commit is one reviewable unit.
 
+- L14 Evidence (T18, parent): `tests/test_server.py` spawn tests fail intermittently
+  under load (fake engram binary misses the 3s `instance-id` probe): 1 of 4 full runs
+  on `main` (v0.3.0) in an isolated worktree, 2 of ~7 on the branch; always green
+  alone. Pre-existing timing flake, not a v0.4.0 regression; follow-up.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
