@@ -308,6 +308,9 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   test-first).
 - T15 compact search: `f8da93e` (Pi gentle-ai-worker, test-first).
 - T16 capture provenance: `1b6c910` (Pi gentle-ai-worker, test-first, own commit).
+- T17 protocol text, docs, CHANGELOG, v0.4.0 bump: `a8f3d14` (Pi gentle-ai-worker,
+  test-first). Branch `feat/engram-3.6-additions`: 828 tests, ruff clean; not
+  pushed or tagged. T18 (live 3.6.0 smoke, review, release) is next.
 
 ## Next step
 
