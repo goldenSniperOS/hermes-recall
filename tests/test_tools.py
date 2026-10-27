@@ -1317,6 +1317,39 @@ def test_a_write_after_finalize_registers_a_continuation_and_its_end_is_posted(
     assert end_paths(fake_engram) == [f"/sessions/{SESSION}%3Aresume%3A2/end"]
 
 
+def test_a_tool_save_after_finalize_registers_a_continuation_first(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    # Seen against a real Engram 3.6.0: without this, mem_save wrote straight into
+    # the finalized root session while background captures used a continuation.
+    wire(fake_engram)
+    fake_engram.route("POST", FINALIZE_PATH, (200, FINALIZED))
+    provider = make_provider(fake_engram.base_url)
+    continuation = f"{SESSION}:resume:2"
+    fake_engram.route("POST", "/sessions", (201, {"id": continuation, "status": "created"}))
+    call(provider, "mem_session_finalize", summary="done")
+    fake_engram.reset()
+
+    result = call(provider, "mem_save", title="After", content="one more fact")
+
+    assert paths(fake_engram) == [("POST", "/sessions"), ("POST", "/observations")]
+    assert only(fake_engram, "POST", "/sessions").json_body["resume"] is True
+    assert only(fake_engram, "POST", "/observations").json_body["session_id"] == continuation
+    assert result["id"] == 900
+
+
+def test_a_tool_save_in_a_registered_session_sends_no_registration(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    call(provider, "mem_save", title="T", content="C")
+
+    assert paths(fake_engram) == [("POST", "/observations")]
+
+
 @pytest.mark.parametrize(
     "answer",
     [

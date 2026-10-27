@@ -540,6 +540,12 @@ def _save(
             provenance=env.provenance(project) if env.provenance is not None else None,
         )
 
+    # Pre-register when the session is not confirmed, like the provider's background
+    # writes do: after a finalize (or an end) the registration is forgotten, and a
+    # save must land in the resume continuation rather than the ended root. A failed
+    # registration still lets the post try, with its own `session not found` retry.
+    if env.ensure_registered is not None:
+        env.ensure_registered(project)
     saved = with_session_retry(env.client, post, lambda: env.register_session(project))
     if saved is None:
         raise _engram_error(env, "save")
