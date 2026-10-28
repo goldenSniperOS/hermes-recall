@@ -41,6 +41,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -50,6 +51,15 @@ from typing import Any
 from . import __version__
 from . import tools as tools_module
 from .config import RecallConfig
+from .format import (
+    consolidated_status,
+    observation_status,
+    pinned_status,
+    saved_status,
+    unpinned_status,
+    updated_status,
+)
+from .redact import PRIVATE_TAG_RE, strip_private
 from .server import STATE_DIRNAME, _rotate_log, engram_bin
 
 logger = logging.getLogger(__name__)
@@ -73,6 +83,26 @@ LOG_FILENAME = "engram-mcp.log"
 # Where the tool schemas came from (``hermes recall status`` names it).
 TOOLS_MCP = "mcp"
 TOOLS_HTTP = "http"
+
+# S12: the only tools a subagent, cron or flush context may call. An explicit
+# allowlist, not Engram's ``readOnlyHint``: any other tool — including one a future
+# Engram adds — counts as a write and is refused before the child is touched.
+READ_TOOLS = frozenset(
+    {
+        "mem_search",
+        "mem_search_prompts",
+        "mem_context",
+        "mem_get_observation",
+        "mem_current_project",
+        "mem_list_projects",
+        "mem_suggest_topic_key",
+        "mem_doctor",
+    }
+)
+
+# Tools whose ``session_id`` / ``id`` is recall's session: their success (or an
+# uncertain outcome) ends it, so the hook's ``/end`` is not posted (S13).
+SESSION_ENDING_TOOLS = frozenset({"mem_session_finalize", "mem_session_end"})
 
 
 class McpError(Exception):
@@ -468,6 +498,14 @@ class ToolCatalog:
     version: str = ""
     names: frozenset[str] = field(default=frozenset())
 
+    def properties(self, name: str) -> frozenset[str]:
+        """The parameter names tool ``name`` declares (what may be injected into it)."""
+        for schema in self.schemas:
+            if schema["name"] == name:
+                props = schema.get("parameters", {}).get("properties")
+                return frozenset(props) if isinstance(props, dict) else frozenset()
+        return frozenset()
+
     @classmethod
     def build(cls, source: str, schemas: list[dict[str, Any]], **fields: Any) -> ToolCatalog:
         return cls(
@@ -572,6 +610,98 @@ def render_result(result: Any) -> tuple[dict[str, Any], bool]:
         return structured, False
     body = _json_object(text)
     return (body if body is not None else {"result": text}), False
+
+
+def canonical_project(name: str) -> str:
+    """Engram's ``CanonicalizeProjectName``: NFC, lower-case, trimmed, no doubled separators."""
+    canonical = unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).lower().strip())
+    while "--" in canonical:
+        canonical = canonical.replace("--", "-")
+    while "__" in canonical:
+        canonical = canonical.replace("__", "_")
+    return canonical
+
+
+def redact_private(value: Any) -> Any:
+    """``value`` with every ``<private>`` block in every string replaced, recursively.
+
+    Only strings that carry a tag are touched (``strip_private`` also trims), so ids,
+    keys and every other argument reach Engram byte for byte.
+    """
+    if isinstance(value, str):
+        return strip_private(value) if PRIVATE_TAG_RE.search(value) else value
+    if isinstance(value, dict):
+        return {key: redact_private(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_private(item) for item in value]
+    return value
+
+
+def _observation_id(value: Any) -> int | None:
+    if isinstance(value, str) and value.strip().lstrip("#").isdigit():
+        value = int(value.strip().lstrip("#"))
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+@dataclass(frozen=True)
+class Effect:
+    """The observation a successful call touched: its id, ``state.json`` action, status."""
+
+    observation_id: int
+    action: str
+    status: str
+    project: str = ""
+
+
+def observation_effect(
+    tool: str, arguments: dict[str, Any], payload: dict[str, Any]
+) -> Effect | None:
+    """What a successful proxied call did to one observation, or ``None`` (S13).
+
+    The id comes from the result when Engram returns one (``id``, a finalize's
+    ``summary_id``, a consolidation's survivor) and from the arguments for the
+    tools whose result names none (``mem_update``, ``mem_get_observation``).
+    """
+    project = payload.get("project") if isinstance(payload.get("project"), str) else ""
+    if tool in ("mem_save", "mem_session_summary"):
+        found = _observation_id(payload.get("id"))
+        action = "saved" if tool == "mem_save" else "session_summary"
+        return Effect(found, action, saved_status(found), project) if found else None
+    if tool in ("mem_update", "mem_get_observation", "mem_pin", "mem_unpin"):
+        found = _observation_id(payload.get("id")) or _observation_id(arguments.get("id"))
+        if not found:
+            return None
+        render, action = {
+            "mem_update": (updated_status, "updated"),
+            "mem_get_observation": (observation_status, "observation"),
+            "mem_pin": (pinned_status, "pinned"),
+            "mem_unpin": (unpinned_status, "unpinned"),
+        }[tool]
+        return Effect(found, action, render(found), project)
+    if tool == "mem_consolidate" and payload.get("status") == "consolidated":
+        survivor = payload.get("survivor") if isinstance(payload.get("survivor"), dict) else {}
+        found = _observation_id(survivor.get("id"))
+        if not found:
+            return None
+        owner = survivor.get("project") if isinstance(survivor.get("project"), str) else ""
+        status = consolidated_status(found, payload.get("soft_deleted_ids"))
+        return Effect(found, "consolidated", status, owner or project)
+    if tool == "mem_session_finalize":
+        found = _observation_id(payload.get("summary_id"))
+        if not found:
+            return None
+        already = payload.get("state") == "already_finalized"
+        label = "session already finalized" if already else "session finalized"
+        return Effect(found, "session_summary", f"🧠 {label}, summary #{found}", project)
+    return None
+
+
+def with_status(payload: dict[str, Any], status: str) -> dict[str, Any]:
+    """``payload`` plus recall's status line, never overwriting a key Engram sent."""
+    key = "status" if "status" not in payload else "recall_status"
+    return {**payload, key: status}
 
 
 class McpProxy:

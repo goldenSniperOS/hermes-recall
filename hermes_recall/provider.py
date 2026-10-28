@@ -23,6 +23,7 @@ from .client import EngramClient
 from .config import RecallConfig, host_hermes_home, load_config, resolve_hermes_home
 from .format import render_recall_block
 from .redact import strip_private, truncate
+from .state import write_state
 
 logger = logging.getLogger(__name__)
 
@@ -1062,7 +1063,8 @@ class RecallProvider(MemoryProvider):
                     len(snapshot),
                 )
                 start = len(snapshot)
-            candidates.extend(_extract_tool_captures(snapshot, start))
+            published = self._catalog.names if self._catalog is not None else frozenset()
+            candidates.extend(_extract_tool_captures(snapshot, start, published))
             self._synced_message_count = len(snapshot)
 
         captures: list[tuple[str, str]] = []
@@ -1466,7 +1468,13 @@ class RecallProvider(MemoryProvider):
             return self._mcp
 
     def _proxy_tool_call(self, catalog: mcp_proxy.ToolCatalog, tool_name: str, args: Any) -> str:
-        """Forward one tool call to Engram's MCP child and return its JSON result."""
+        """Forward one tool call to Engram's MCP child and return its JSON result.
+
+        In order: the write gate (S12, before the child is touched), private-tag
+        redaction of a write's strings, the session/project bindings (S11), the call
+        (with one re-registration on ``unknown_session``), then the side effects
+        (S13): the status line, ``state.json`` and the ``/end`` suppression.
+        """
         if tool_name not in catalog.names:
             return tools_module.error_result(f"unknown tool: {tool_name}")
         arguments = tools_module.parse_arguments(args)
@@ -1474,8 +1482,160 @@ class RecallProvider(MemoryProvider):
             return tools_module.error_result("arguments must be a JSON object")
         if self._shutting_down:
             return tools_module.error_result("recall is shutting down")
-        outcome = self._mcp_proxy(catalog).call(tool_name, arguments)
-        return tools_module.dump(outcome.payload)
+        is_read = tool_name in mcp_proxy.READ_TOOLS
+        if not is_read and not self._writes_enabled:
+            return tools_module.error_result(
+                "Engram writes are disabled for subagents and other non-primary "
+                f"contexts (agent_context={self._agent_context}); read tools still work."
+            )
+        runtime_id = self._session_id
+        if tool_name == "mem_session_start":
+            return tools_module.dump(self._bind_session_start(runtime_id))
+        if not is_read:
+            arguments = mcp_proxy.redact_private(arguments)
+        bound, own_session = self._bind_arguments(
+            tool_name, arguments, catalog.properties(tool_name), runtime_id
+        )
+        proxy = self._mcp_proxy(catalog)
+        outcome = proxy.call(tool_name, bound)
+        if (
+            own_session
+            and "session_id" in bound
+            and outcome.refused
+            and outcome.payload.get("error_code") == "unknown_session"
+            and self._register_session_now(self._ensure_project(), session_id=runtime_id)
+        ):
+            # Engram lost the row (or never had it): register again, retry once.
+            bound = {**bound, "session_id": self._effective_session_id(runtime_id)}
+            outcome = proxy.call(tool_name, bound)
+        return tools_module.dump(
+            self._proxy_side_effects(tool_name, bound, outcome, own_session, runtime_id)
+        )
+
+    def _bind_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        properties: frozenset[str],
+        runtime_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Inject what recall owns into one call (S11). Returns ``(arguments, own_session)``.
+
+        * ``project``: the detected project, when the schema has it and the model
+          gave none (and is not searching ``all_projects``, which Engram refuses to
+          combine with a project).
+        * ``cwd``: the working directory, for ``mem_current_project`` without one.
+        * ``session_id``: recall's effective session, registered first, replacing
+          whatever the model sent; left out when the model names another project
+          (Engram would refuse ``session_project_mismatch``) or when no registration
+          can be confirmed (an id Engram does not know is refused ``unknown_session``).
+        * ``mem_session_end``'s ``id``: recall's effective session.
+
+        ``expected_project`` is never injected: it is the caller's assertion.
+        ``own_session`` says the call names recall's session.
+        """
+        bound = dict(arguments)
+        if (
+            "project" in properties
+            and not _given(bound.get("project"))
+            and not _truthy(bound.get("all_projects"))
+        ):
+            project = self._ensure_project()
+            if project:
+                bound["project"] = project
+        if (
+            tool_name == "mem_current_project"
+            and "cwd" in properties
+            and not _given(bound.get("cwd"))
+            and not _given(bound.get("directory"))
+        ):
+            directory = _working_directory()
+            if directory:
+                bound["cwd"] = directory
+        if tool_name == "mem_session_end" and runtime_id:
+            bound["id"] = self._effective_session_id(runtime_id)
+            return bound, True
+        if "session_id" not in properties:
+            return bound, False
+        bound.pop("session_id", None)
+        if not runtime_id or not self._writes_enabled:
+            return bound, False
+        own = self._ensure_project()
+        named = bound.get("project") if "project" in properties else None
+        if not own or (
+            _given(named)
+            and mcp_proxy.canonical_project(str(named)) != mcp_proxy.canonical_project(own)
+        ):
+            return bound, False
+        registered = runtime_id == self._registered_session_id or self._register_session_now(
+            own, session_id=runtime_id
+        )
+        if not registered:
+            logger.debug("recall: session not confirmed; forwarding %s without it", tool_name)
+            return bound, False
+        bound["session_id"] = self._effective_session_id(runtime_id)
+        return bound, True
+
+    def _bind_session_start(self, runtime_id: str) -> dict[str, Any]:
+        """``mem_session_start`` is answered by recall: the session is the one recall owns.
+
+        Never forwarded. The child would register the model's id under the project
+        of its own cwd, while every write is bound to recall's session anyway. So the
+        call registers recall's session (the same ``POST /sessions`` writes use) and
+        reports the effective id.
+        """
+        project = self._ensure_project()
+        if not runtime_id or not project:
+            return {"error": "no active Hermes session or project to start in Engram"}
+        if runtime_id != self._registered_session_id and not self._register_session_now(
+            project, session_id=runtime_id
+        ):
+            reason = self._client.last_error_text() or "no response"
+            return {"error": f"could not register recall's session with Engram: {reason}"}
+        effective = self._effective_session_id(runtime_id)
+        return {
+            "session_id": effective,
+            "project": project,
+            "result": (
+                f"Session {effective!r} is recall's Hermes session for project {project!r}; "
+                "Engram writes use it automatically."
+            ),
+        }
+
+    def _proxy_side_effects(
+        self,
+        tool_name: str,
+        bound: dict[str, Any],
+        outcome: mcp_proxy.CallOutcome,
+        own_session: bool,
+        runtime_id: str,
+    ) -> dict[str, Any]:
+        """The status line, ``state.json`` and ``/end`` suppression of one call (S13)."""
+        payload = outcome.payload
+        if own_session and tool_name in mcp_proxy.SESSION_ENDING_TOOLS:
+            ended = outcome.ok or outcome.uncertain
+            if ended or payload.get("error_code") == "session_already_ended":
+                # Ended, or may have: the hook's /end is not posted, and the next write
+                # registers again (a resume continuation).
+                self._session_finalized(runtime_id)
+        if not outcome.ok:
+            return payload
+        effect = mcp_proxy.observation_effect(tool_name, bound, payload)
+        if effect is None:
+            return payload
+        if self._writes_enabled:
+            # state.json describes the user's own agent: never a guest's reads.
+            project = effect.project or str(bound.get("project") or "") or self._project
+            try:
+                write_state(
+                    resolve_hermes_home(self._hermes_home),
+                    last_memory_id=effect.observation_id,
+                    last_action=effect.action,
+                    project=project,
+                )
+            except Exception:
+                logger.debug("recall: state write failed (non-fatal)", exc_info=True)
+        return mcp_proxy.with_status(payload, effect.status)
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
         """Run one tool (proxied to Engram's MCP, or the v0.4 HTTP one). Never raises.
@@ -1677,6 +1837,20 @@ def _acknowledged_session(runtime_id: str, ack: dict[str, Any]) -> str:
     return ""
 
 
+def _given(value: Any) -> bool:
+    """Whether the model supplied an argument (a blank string counts as absent)."""
+    if value is None:
+        return False
+    return bool(value.strip()) if isinstance(value, str) else True
+
+
+def _truthy(value: Any) -> bool:
+    """A boolean argument as Engram reads it (``true`` or a true-ish string)."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return value is True
+
+
 def _normalize_query(query: str) -> str:
     """Strip the turn text and cap it at :data:`QUERY_MAX_CHARS`."""
     if not isinstance(query, str):
@@ -1720,7 +1894,9 @@ def _working_directory() -> str:
         return ""
 
 
-def _extract_tool_captures(messages: list[Any], start: int) -> list[tuple[str, str]]:
+def _extract_tool_captures(
+    messages: list[Any], start: int, published: frozenset[str] = frozenset()
+) -> list[tuple[str, str]]:
     """Return ``(source, content)`` for every tool result at or after index ``start``.
 
     A tool result is a message with ``role == "tool"`` and non-empty string content.
@@ -1730,7 +1906,8 @@ def _extract_tool_captures(messages: list[Any], start: int) -> list[tuple[str, s
     Anything whose shape is not recognised is **skipped, not guessed**: this parses a
     transcript produced by someone else, and inventing a capture out of a shape we do
     not understand is how a memory store fills with nonsense. Results from this
-    provider's own tools are skipped too — see :data:`_MEMORY_TOOL_NAMES`.
+    provider's own tools are skipped too — see :data:`_MEMORY_TOOL_NAMES` — and so
+    are those of every tool it ``published`` (the proxied Engram MCP tools).
     """
     tool_call_names = _tool_call_names(messages)
     captures: list[tuple[str, str]] = []
@@ -1741,7 +1918,7 @@ def _extract_tool_captures(messages: list[Any], start: int) -> list[tuple[str, s
         if not isinstance(content, str) or not content:
             continue
         source = _tool_source(message, tool_call_names)
-        if _is_memory_tool(source):
+        if _is_memory_tool(source) or source.lower() in published:
             continue
         captures.append((source, content))
     return captures
