@@ -294,7 +294,7 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
       lifecycle. Route: delegated (gentle-ai-worker), test-first with a fake MCP child.
 - [x] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
 - [x] T21 S14 fallback + status line. Route: same worker.
-- [ ] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
+- [x] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
 - [ ] T23 Verify (independent: concurrency + write gate are high risk), real Engram
       3.6.0 isolated smoke of all 23 tools' binding, release v0.5.0, live install,
       remove the Engram MCP from Hermes. Route: parent.
@@ -384,6 +384,21 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   when it is made, so `hermes recall status` (another process) can name it; `/recall`
   uses the live catalog. The status block gains a `tools:` line only when a source is
   known or asked for, so the v0.4 layout is otherwise unchanged.
+- L31 Decision (T22, worker): `provides_tools` stays a static list (Hermes reads it only
+  for the plugin catalog and `plugins doctor`; memory-provider tools are routed from
+  `get_tool_schemas`). It names every tool the provider can publish on a default
+  install: Engram 3.6.0's 23 agent tools in upstream order, then `mem_timeline`, which
+  only the HTTP fallback serves; the packaging test pins that list to the fake MCP
+  child's 3.6.0 copy. `memory.recall.tools` is declared `type: list, default: []`.
+- L32 Evidence (T22, worker): against the real Engram 3.6.0 binary with an isolated
+  `ENGRAM_DATA_DIR` and `HERMES_HOME`, `mcp_proxy.discover` took 0.055 s, listed 23
+  tools (version 3.6.0) and mapped them to 26,783 bytes of Hermes schemas (30.4 KB
+  raw with annotations); a second call hit the in-process cache. The README and
+  CHANGELOG quote ~27 KB against ~5.5 KB for the v0.4 tools.
+- L33 Process note (T19, worker): to split T19 into two commits, a copy of
+  `hermes_recall/mcp_proxy.py` was kept at `/tmp/mcp_proxy_full.py` while the reduced
+  first half was committed; it holds only that repository source and was left in
+  place (deleting is outside the worker's permissions).
 
 ## Acceptance criteria
 
@@ -485,6 +500,12 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
   `45fa1cd` + `9737aa9` (Pi gentle-ai-worker, test-first with a fake MCP child).
 - T20 injection, write gate, side effects: `fcf7aba` (Pi gentle-ai-worker, test-first).
 - T21 S14 fallback and tool-source status: `ba0d89c` (Pi gentle-ai-worker, test-first).
+- T22 docs (README, design, install prompt), CHANGELOG 0.5.0, version bump,
+  `provides_tools`, `memory.recall.tools` in the manifest: `c4c29bb` (Pi
+  gentle-ai-worker, test-first for the packaging invariants). Branch
+  `feat/mcp-proxy`: 918 tests, ruff clean; not pushed or tagged. T23 (independent
+  verify, real 3.6.0 smoke of all 23 bindings, release, live install, remove the
+  Engram MCP from Hermes) is next.
 
 ## Next step
 
