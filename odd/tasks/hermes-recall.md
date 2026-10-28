@@ -142,7 +142,7 @@ a clear "needs Engram >= 3.5.1" tool error, never a crash.
 - [x] T15 S1 compact search (tool + prefetch). Route: inline.
 - [x] T16 S6 capture provenance. Route: inline (own commit; writes data).
 - [x] T17 S7 protocol text, README/design/CHANGELOG, v0.4.0 version bump. Route: inline.
-- [ ] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
+- [x] T18 Verify (real Engram 3.6.0 isolated smoke), native review per RDD, release
       v0.4.0, restart live Engram on 3.6.0, live `hermes plugins update recall`.
 
 Route note: all units share `client.py`/`tools.py`, so they are not independent
@@ -236,6 +236,12 @@ writers; done inline, test-first, in ~400-line commits.
   under load (fake engram binary misses the 3s `instance-id` probe): 1 of 4 full runs
   on `main` (v0.3.0) in an isolated worktree, 2 of ~7 on the branch; always green
   alone. Pre-existing timing flake, not a v0.4.0 regression; follow-up.
+
+- L15 Release (T18, owner-approved): main fast-forwarded to 3b82722, tag v0.4.0
+  pushed, CI and Release green (4 assets). Live Engram was already 3.6.0 (restarted
+  2026-10-28 17:43, 793 observations). `hermes plugins update recall` -> 0.4.0 at
+  3b82722; `memory status` shows recall active, `recall status` reachable. The
+  running Hermes gateway loads it after the owner's /restart.
 
 ## Acceptance criteria
 
