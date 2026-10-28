@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import os
@@ -14,11 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import client as client_module
+from . import mcp_proxy
 from . import server as server_module
 from . import tools as tools_module
 from ._hermes import MemoryProvider, RecallStatus, is_trivial_prompt
 from .client import EngramClient
-from .config import RecallConfig, load_config, resolve_hermes_home
+from .config import RecallConfig, host_hermes_home, load_config, resolve_hermes_home
 from .format import render_recall_block
 from .redact import strip_private, truncate
 
@@ -326,6 +328,15 @@ class RecallProvider(MemoryProvider):
         # per provider instance" rule a single check-and-set under the worker lock.
         self._server_status: server_module.ServerStatus | None = None
         self._server_restart_used = False
+
+        # Tool source (mcp_proxy.py): decided on the first get_tool_schemas, which
+        # the host calls before initialize, and fixed for this instance because the
+        # host routes tool calls by that first answer. The MCP child is started on
+        # the first proxied call and stopped on shutdown.
+        self._catalog: mcp_proxy.ToolCatalog | None = None
+        self._catalog_lock = threading.Lock()
+        self._mcp: mcp_proxy.McpProxy | None = None
+        self._mcp_lock = threading.Lock()
         try:
             setter = getattr(self._client, "set_refusal_listener", None)
             if callable(setter):
@@ -514,6 +525,7 @@ class RecallProvider(MemoryProvider):
                 self._shutting_down = True
                 thread = self._worker
                 self._worker = None
+            self._stop_mcp()
             if thread is None:
                 return
             try:
@@ -523,6 +535,16 @@ class RecallProvider(MemoryProvider):
             thread.join(SHUTDOWN_DRAIN_TIMEOUT_S)
         except Exception:
             logger.debug("recall shutdown failed (non-fatal)", exc_info=True)
+
+    def _stop_mcp(self) -> None:
+        """Stop the MCP child (never ``engram serve``). Never raises, never waits on a call."""
+        try:
+            with self._mcp_lock:
+                proxy = self._mcp
+            if proxy is not None:
+                proxy.close()
+        except Exception:
+            logger.debug("recall: stopping the MCP child failed (non-fatal)", exc_info=True)
 
     # -- Background worker ---------------------------------------------------
 
@@ -1405,20 +1427,58 @@ class RecallProvider(MemoryProvider):
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        """Return the ``mem_*`` schemas, or ``[]`` when recall is disabled.
+        """Return the published tool schemas, or ``[]`` when recall is disabled.
 
-        Cheap, pure and side-effect free: the host calls it at least three times
+        Engram's own MCP tools (``engram mcp --tools=agent``) when the proxy can
+        serve them, else the v0.4 HTTP tools (see :func:`mcp_proxy.build_catalog`).
+        The first call may run a short discovery child; every later one is a copy
+        of the cached answer, with no I/O: the host calls it at least three times
         during registration alone (conflict check, routing table, log line).
         """
         try:
             if not self._config.enabled:
                 return []
-            return tools_module.get_tool_schemas()
+            return [copy.deepcopy(schema) for schema in self._tool_catalog().schemas]
         except Exception:
             return []
 
+    def _tool_catalog(self) -> mcp_proxy.ToolCatalog:
+        """The tool source, decided once per provider instance."""
+        catalog = self._catalog
+        if catalog is not None:
+            return catalog
+        with self._catalog_lock:
+            if self._catalog is None:
+                self._catalog = mcp_proxy.build_catalog(
+                    self._config, host_hermes_home(self._hermes_home)
+                )
+            return self._catalog
+
+    def _mcp_proxy(self, catalog: mcp_proxy.ToolCatalog) -> mcp_proxy.McpProxy:
+        """This provider's MCP proxy, created on first use (the child starts lazily)."""
+        with self._mcp_lock:
+            if self._mcp is None:
+                self._mcp = mcp_proxy.McpProxy(
+                    catalog.binary,
+                    cwd=_working_directory,
+                    log_file=lambda: mcp_proxy.log_path(host_hermes_home(self._hermes_home)),
+                )
+            return self._mcp
+
+    def _proxy_tool_call(self, catalog: mcp_proxy.ToolCatalog, tool_name: str, args: Any) -> str:
+        """Forward one tool call to Engram's MCP child and return its JSON result."""
+        if tool_name not in catalog.names:
+            return tools_module.error_result(f"unknown tool: {tool_name}")
+        arguments = tools_module.parse_arguments(args)
+        if arguments is None:
+            return tools_module.error_result("arguments must be a JSON object")
+        if self._shutting_down:
+            return tools_module.error_result("recall is shutting down")
+        outcome = self._mcp_proxy(catalog).call(tool_name, arguments)
+        return tools_module.dump(outcome.payload)
+
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
-        """Run one ``mem_*`` tool and return its JSON result. Never raises.
+        """Run one tool (proxied to Engram's MCP, or the v0.4 HTTP one). Never raises.
 
         ``**kwargs`` is accepted and ignored: the host forwards whatever context it
         has, and nothing in it is needed to talk to Engram.
@@ -1431,6 +1491,11 @@ class RecallProvider(MemoryProvider):
                 return tools_module.error_result(
                     f"Engram server not used (foreign instance): {foreign}"
                 )
+            catalog = self._tool_catalog()
+            if catalog.source == mcp_proxy.TOOLS_MCP:
+                return self._proxy_tool_call(catalog, tool_name, args)
+            if tool_name not in catalog.names:
+                return tools_module.error_result(f"unknown tool: {tool_name}")
             runtime_id = self._session_id
             env = tools_module.ToolEnv(
                 client=self._client,

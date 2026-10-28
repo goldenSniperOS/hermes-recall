@@ -307,15 +307,8 @@ def handle_tool_call(env: ToolEnv, tool_name: str, args: Any) -> str:
     try:
         if tool_name not in TOOL_NAMES:
             return error_result(f"unknown tool: {tool_name}")
+        args = parse_arguments(args)
         if args is None:
-            args = {}
-        if isinstance(args, str):
-            # Some hosts hand over the raw JSON arguments string.
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError:
-                return error_result("arguments must be a JSON object")
-        if not isinstance(args, dict):
             return error_result("arguments must be a JSON object")
         if tool_name in WRITE_TOOLS and not env.writes_enabled:
             return error_result(
@@ -331,8 +324,28 @@ def handle_tool_call(env: ToolEnv, tool_name: str, args: Any) -> str:
         return error_result(f"{tool_name} failed: {type(exc).__name__}")
 
 
+def parse_arguments(args: Any) -> dict[str, Any] | None:
+    """The tool arguments as a dict, or ``None`` when they are not a JSON object.
+
+    ``None`` means "no arguments"; some hosts hand over the raw JSON string.
+    """
+    if args is None:
+        return {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            return None
+    return args if isinstance(args, dict) else None
+
+
 def _dump(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def dump(payload: Any) -> str:
+    """Serialize a tool result the way every handler does."""
+    return _dump(payload)
 
 
 def error_result(message: str) -> str:

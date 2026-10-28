@@ -41,12 +41,15 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import tools as tools_module
+from .config import RecallConfig
 from .server import STATE_DIRNAME, _rotate_log, engram_bin
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,10 @@ _MAX_LIST_PAGES = 20
 
 CACHE_FILENAME = "mcp-tools.json"
 LOG_FILENAME = "engram-mcp.log"
+
+# Where the tool schemas came from (``hermes recall status`` names it).
+TOOLS_MCP = "mcp"
+TOOLS_HTTP = "http"
 
 
 class McpError(Exception):
@@ -445,3 +452,235 @@ def to_hermes_schema(tool: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(parameters, dict)
         else {"type": "object", "properties": {}},
     }
+
+
+# -- the tool catalog the provider publishes ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToolCatalog:
+    """The tool set this provider publishes: Engram's MCP tools or the v0.4 HTTP ones."""
+
+    source: str
+    reason: str = ""
+    schemas: tuple[dict[str, Any], ...] = ()
+    binary: str = ""
+    version: str = ""
+    names: frozenset[str] = field(default=frozenset())
+
+    @classmethod
+    def build(cls, source: str, schemas: list[dict[str, Any]], **fields: Any) -> ToolCatalog:
+        return cls(
+            source=source,
+            schemas=tuple(schemas),
+            names=frozenset(schema["name"] for schema in schemas),
+            **fields,
+        )
+
+
+def _allowed(schemas: list[dict[str, Any]], allowlist: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not allowlist:
+        return schemas
+    return [schema for schema in schemas if schema["name"] in allowlist]
+
+
+def http_catalog(config: RecallConfig, reason: str) -> ToolCatalog:
+    """The v0.4 HTTP tool set (``tools.py``), unchanged apart from the allowlist."""
+    schemas = _allowed(tools_module.get_tool_schemas(), config.tools)
+    return ToolCatalog.build(TOOLS_HTTP, schemas, reason=reason)
+
+
+def build_catalog(config: RecallConfig, hermes_home: str) -> ToolCatalog:
+    """Decide the tool source once per provider. Never raises.
+
+    Proxy when the ``engram`` binary resolves and lists its tools; otherwise the
+    v0.4 HTTP tools, with the reason.
+    """
+    try:
+        binary = resolve_binary()
+        if not binary:
+            return http_catalog(config, f'Engram binary "{engram_bin()}" not found')
+        discovery = discover(binary, hermes_home)
+        if discovery.error:
+            return http_catalog(config, discovery.error)
+        mapped = [to_hermes_schema(tool) for tool in discovery.tools]
+        schemas = _allowed([schema for schema in mapped if schema], config.tools)
+        return ToolCatalog.build(
+            TOOLS_MCP,
+            schemas,
+            reason=f"engram mcp {MCP_ARGS[1]} (Engram {discovery.version or 'unknown'})",
+            binary=binary,
+            version=discovery.version,
+        )
+    except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
+        logger.debug("recall: tool catalog failed; using the HTTP tools", exc_info=True)
+        return http_catalog(config, f"tool discovery failed: {type(exc).__name__}")
+
+
+# -- calls ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CallOutcome:
+    """One proxied call: the JSON payload for the model plus what happened.
+
+    ``ok``: Engram answered without ``isError``. ``refused``: Engram answered with
+    ``isError`` or a JSON-RPC error. ``uncertain``: the request reached the child but
+    no answer came back, so Engram may have applied it.
+    """
+
+    payload: dict[str, Any]
+    ok: bool = False
+    refused: bool = False
+    uncertain: bool = False
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def render_result(result: Any) -> tuple[dict[str, Any], bool]:
+    """An MCP ``tools/call`` result as the JSON object handed to the model.
+
+    Structured content wins; otherwise the text items, joined, parsed as a JSON
+    object when they are one (Engram's results are), else ``{"result": text}``. An
+    ``isError`` result becomes ``{"error": <message>}`` plus the other fields of a
+    JSON error body (``error_code``, ``hint``, ``available_projects``, ...). Returns
+    ``(payload, is_error)``.
+    """
+    if not isinstance(result, dict):
+        return {"result": result}, False
+    texts = [
+        item["text"]
+        for item in result.get("content") or []
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    ]
+    text = "\n".join(texts)
+    if result.get("isError") is True:
+        body = _json_object(text)
+        if body is None:
+            return {"error": text or "Engram reported an error"}, True
+        message = body.get("message") or body.get("error") or text
+        rest = {key: value for key, value in body.items() if key not in ("message", "error")}
+        return {"error": message, **rest}, True
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured, False
+    body = _json_object(text)
+    return (body if body is not None else {"result": text}), False
+
+
+class McpProxy:
+    """The provider's long-lived MCP child: lazy start, one call at a time, one restart."""
+
+    def __init__(
+        self,
+        binary: str,
+        *,
+        cwd: Callable[[], str] | None = None,
+        log_file: Callable[[], str] | None = None,
+    ) -> None:
+        self._binary = binary
+        self._cwd = cwd or (lambda: "")
+        self._log_file = log_file or (lambda: "")
+        self._call_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._child: McpChild | None = None
+        self._spawned = False
+        self._restart_used = False
+        self._closed = False
+
+    def child_alive(self) -> bool:
+        child = self._child
+        return child is not None and child.alive()
+
+    def call(self, name: str, arguments: dict[str, Any]) -> CallOutcome:
+        """Forward one ``tools/call``. Never raises; never retries a sent call."""
+        timeout = CALL_TIMEOUT_S
+        # Long enough to queue behind one whole call (start, call, kill), never forever.
+        wait = START_TIMEOUT_S + timeout + 2 * STOP_TIMEOUT_S
+        if not self._call_lock.acquire(timeout=wait):
+            return CallOutcome({"error": "Engram MCP is busy with another call; try again"})
+        try:
+            child, problem = self._ensure_child()
+            if child is None:
+                return CallOutcome({"error": problem})
+            try:
+                result = child.request(
+                    "tools/call", {"name": name, "arguments": arguments}, timeout
+                )
+            except McpRefusal as exc:
+                return CallOutcome({"error": f"Engram MCP refused {name}: {exc}"}, refused=True)
+            except McpError as exc:
+                self._discard(child)
+                if exc.timed_out:
+                    message = f"Engram MCP did not answer {name} within {timeout:g}s"
+                else:
+                    message = f"Engram MCP exited during {name}"
+                if exc.delivered:
+                    message += "; it may have been applied, so check before repeating a write"
+                return CallOutcome({"error": message}, uncertain=exc.delivered)
+            payload, is_error = render_result(result)
+            return CallOutcome(payload, ok=not is_error, refused=is_error)
+        except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
+            logger.debug("recall: MCP call %s failed", name, exc_info=True)
+            return CallOutcome({"error": f"{name} failed: {type(exc).__name__}"})
+        finally:
+            self._call_lock.release()
+
+    def _ensure_child(self) -> tuple[McpChild | None, str]:
+        """The running child, starting it (or its one restart) when needed."""
+        with self._state_lock:
+            if self._closed:
+                return None, "Engram MCP proxy is stopped"
+            child = self._child
+        if child is not None and child.alive():
+            return child, ""
+        if child is not None:
+            self._discard(child)
+        if self._spawned:
+            if self._restart_used:
+                return None, (
+                    "Engram MCP is not running and was already restarted once in this "
+                    "session; memory tools are unavailable until Hermes restarts"
+                )
+            self._restart_used = True
+        self._spawned = True
+        try:
+            child = McpChild.spawn(self._binary, cwd=self._cwd(), log_path=self._log_file())
+        except McpError as exc:
+            return None, f"could not start Engram MCP: {exc}"
+        try:
+            child.initialize(START_TIMEOUT_S)
+        except (McpError, McpRefusal) as exc:
+            child.stop()
+            return None, f"could not start Engram MCP: {exc}"
+        with self._state_lock:
+            if self._closed:
+                child.stop()
+                return None, "Engram MCP proxy is stopped"
+            self._child = child
+        return child, ""
+
+    def _discard(self, child: McpChild) -> None:
+        with self._state_lock:
+            if self._child is child:
+                self._child = None
+        child.kill()
+        child.stop()
+
+    def close(self) -> None:
+        """Stop the child without waiting for an in-flight call. Never raises."""
+        try:
+            with self._state_lock:
+                self._closed = True
+                child = self._child
+                self._child = None
+            if child is not None:
+                child.stop()
+        except Exception:
+            logger.debug("recall: MCP proxy close failed", exc_info=True)
