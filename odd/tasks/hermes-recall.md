@@ -292,7 +292,7 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
 
 - [x] T19 S9+S10 stdio MCP client + schema discovery/cache + proxy dispatch, child
       lifecycle. Route: delegated (gentle-ai-worker), test-first with a fake MCP child.
-- [ ] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
+- [x] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
 - [ ] T21 S14 fallback + status line. Route: same worker.
 - [ ] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
 - [ ] T23 Verify (independent: concurrency + write gate are high risk), real Engram
@@ -343,6 +343,35 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
 - L24 Delivery (T19): the work unit is two commits over the ~400-line guide:
   45fa1cd (discovery, 1037 lines: 365 are the fake MCP child, 118 tests) and 9737aa9
   (dispatch and lifecycle, 781 lines: ~430 tests).
+- L25 Decision (T20, worker): `mem_session_start` is answered by recall and never
+  forwarded: the real 3.6.0 handler registers the given id under the project of the
+  child's own cwd (`project` "intentionally not read"), while every write is bound to
+  recall's session anyway. It registers recall's session (the same `POST /sessions`
+  writes use) and returns the effective id. `mem_session_end` is forwarded with `id`
+  replaced by the effective session; success or an uncertain outcome suppresses the
+  hook's `/end` like a finalize. Both count as writes (S12).
+- L26 Decision (T20, worker): `session_id` is injected only after a confirmed
+  registration; when none can be confirmed the call goes out without it (the real child
+  refuses an unknown id with `unknown_session`, and without one Engram writes to the
+  project's own manual-save session). An `unknown_session` refusal re-registers and
+  retries once. "Another project" compares Engram's canonical names (NFC, lower-case,
+  trimmed, collapsed `--`/`__`). `project` is not injected when `all_projects` is
+  truthy (Engram refuses the combination on `mem_search_prompts`); `cwd` only when
+  neither `cwd` nor `directory` was given.
+- L27 Decision (T20, worker): S12 read allowlist = `mem_search`, `mem_search_prompts`,
+  `mem_context`, `mem_get_observation`, `mem_current_project`, `mem_list_projects`,
+  `mem_suggest_topic_key`, `mem_doctor` (the tools Engram 3.6.0 marks `readOnlyHint`;
+  the hint itself is not trusted). Subagent/cron/flush providers may start their own
+  child for these reads (it opens the same store, is stopped on their shutdown, and
+  Hermes builds subagents with `skip_memory`, so in practice cron and flush).
+- L28 Decision (T20, worker): S13 effects. Private tags are redacted recursively in every
+  string of a write's arguments, and only strings carrying a tag are touched. The status
+  line goes under `status`, or `recall_status` when Engram's payload already has
+  `status` (`mem_consolidate`): the upstream result is never altered. Ids come from the
+  result (`id`, finalize `summary_id`, consolidation survivor) or, for `mem_update` and
+  `mem_get_observation`, from the arguments. A finalize for another project (no session
+  injected) leaves recall's session open. Proxied tool names join the passive-capture
+  skip list. T20 is one commit of ~900 lines (~560 tests).
 
 ## Acceptance criteria
 
@@ -442,6 +471,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 
 - T19 stdio MCP client, discovery and schema cache, proxy dispatch, child lifecycle:
   `45fa1cd` + `9737aa9` (Pi gentle-ai-worker, test-first with a fake MCP child).
+- T20 injection, write gate, side effects: `fcf7aba` (Pi gentle-ai-worker, test-first).
 
 ## Next step
 
