@@ -60,7 +60,7 @@ from .format import (
     updated_status,
 )
 from .redact import PRIVATE_TAG_RE, strip_private
-from .server import STATE_DIRNAME, _rotate_log, engram_bin
+from .server import STATE_DIRNAME, _rotate_log, engram_bin, is_spawnable_url
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,9 @@ _MAX_LIST_PAGES = 20
 
 CACHE_FILENAME = "mcp-tools.json"
 LOG_FILENAME = "engram-mcp.log"
+# The tool source this profile's provider last chose, for ``hermes recall status``
+# (a separate process with no provider of its own).
+SOURCE_FILENAME = "tools.json"
 
 # Where the tool schemas came from (``hermes recall status`` names it).
 TOOLS_MCP = "mcp"
@@ -506,6 +509,13 @@ class ToolCatalog:
                 return frozenset(props) if isinstance(props, dict) else frozenset()
         return frozenset()
 
+    def label(self) -> str:
+        """One status line: which tools the model has, and why when it is the fallback."""
+        count = f"{len(self.schemas)} tools"
+        if self.source == TOOLS_MCP:
+            return f"Engram MCP, {count} (Engram {self.version or 'unknown'})"
+        return f"HTTP fallback, {count}: {self.reason}" if self.reason else f"HTTP, {count}"
+
     @classmethod
     def build(cls, source: str, schemas: list[dict[str, Any]], **fields: Any) -> ToolCatalog:
         return cls(
@@ -531,10 +541,27 @@ def http_catalog(config: RecallConfig, reason: str) -> ToolCatalog:
 def build_catalog(config: RecallConfig, hermes_home: str) -> ToolCatalog:
     """Decide the tool source once per provider. Never raises.
 
-    Proxy when the ``engram`` binary resolves and lists its tools; otherwise the
-    v0.4 HTTP tools, with the reason.
+    The proxy needs all of (S14): no ``ENGRAM_URL`` and a configured URL that is the
+    local default address — the MCP child opens the local SQLite store directly, so
+    its writes must land where the HTTP server recall talks to reads — plus an
+    ``engram`` binary that lists its tools. Otherwise the v0.4 HTTP tools, with the
+    reason. (A foreign instance is only known after ``initialize``; the provider then
+    refuses every tool call, whichever source was published.)
     """
     try:
+        if str(os.environ.get("ENGRAM_URL", "") or "").strip():
+            return http_catalog(
+                config,
+                "ENGRAM_URL is set; Engram's MCP opens the local store, so it is not "
+                "paired with an externally managed server",
+            )
+        url = str(config.url).strip()
+        if not is_spawnable_url(url):
+            return http_catalog(
+                config,
+                f"{url} is not the local default Engram address; Engram's MCP opens the "
+                "local store, so it is only paired with that server",
+            )
         binary = resolve_binary()
         if not binary:
             return http_catalog(config, f'Engram binary "{engram_bin()}" not found')
@@ -553,6 +580,54 @@ def build_catalog(config: RecallConfig, hermes_home: str) -> ToolCatalog:
     except Exception as exc:  # noqa: BLE001 - the contract is "never raise"
         logger.debug("recall: tool catalog failed; using the HTTP tools", exc_info=True)
         return http_catalog(config, f"tool discovery failed: {type(exc).__name__}")
+
+
+def write_tool_source(hermes_home: str, catalog: ToolCatalog) -> None:
+    """Record the chosen tool source in ``<hermes_home>/recall/tools.json``. Never raises."""
+    if not hermes_home:
+        return
+    try:
+        directory = recall_dir(hermes_home)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "source": catalog.source,
+            "reason": catalog.reason,
+            "count": len(catalog.schemas),
+            "version": catalog.version,
+            "label": catalog.label(),
+            "updated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        fd, tmp_name = tempfile.mkstemp(prefix=".tools-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp_name, directory / SOURCE_FILENAME)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        logger.debug("recall: could not record the tool source (non-fatal)", exc_info=True)
+
+
+def read_tool_source(hermes_home: str) -> dict[str, Any] | None:
+    """The recorded tool source, or ``None`` when missing or unreadable. Never raises."""
+    try:
+        payload = json.loads((recall_dir(hermes_home) / SOURCE_FILENAME).read_text("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("source") not in (TOOLS_MCP, TOOLS_HTTP):
+        return None
+    return payload
+
+
+def recorded_label(hermes_home: str) -> str:
+    """The status line for the recorded tool source (``hermes recall status``)."""
+    recorded = read_tool_source(hermes_home)
+    label = recorded.get("label") if recorded is not None else None
+    return label if isinstance(label, str) and label else "— (not recorded yet)"
 
 
 # -- calls ------------------------------------------------------------------------------

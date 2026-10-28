@@ -1049,8 +1049,12 @@ def status_report(
     project: str = "",
     recall_count: int | None = None,
     server_status: Any = None,
+    tools_label: str = "",
 ) -> str:
     """Probe Engram health and render the shared plain-text status block. Never raises.
+
+    ``tools_label`` names the tool source (Engram MCP or the HTTP fallback, see
+    ``mcp_proxy.ToolCatalog.label``); the line is omitted when it is blank.
 
     ``server_status`` is the in-process auto-start outcome (a ``ServerStatus``); when
     it is ``None`` the outcome recorded in ``<hermes_home>/recall/server.json`` is
@@ -1073,6 +1077,7 @@ def status_report(
             url=client.base_url,
             server_origin=getattr(lifecycle, "status", "") or "",
             server_reason=getattr(lifecycle, "reason", "") or "",
+            tools=tools_label,
         )
     except Exception:
         return "🧠 Recall — status unavailable"

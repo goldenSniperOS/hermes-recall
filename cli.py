@@ -42,11 +42,17 @@ def status_text() -> str:
     config_module = import_module(f"{package.__name__}.config")
     client_module = import_module(f"{package.__name__}.client")
     tools_module = import_module(f"{package.__name__}.tools")
+    mcp_module = import_module(f"{package.__name__}.mcp_proxy")
 
     config = config_module.load_config()
     client = client_module.EngramClient(config)
     hermes_home = config_module.resolve_hermes_home()
-    return tools_module.status_report(client, hermes_home, project=config.project_override)
+    return tools_module.status_report(
+        client,
+        hermes_home,
+        project=config.project_override,
+        tools_label=mcp_module.recorded_label(hermes_home),
+    )
 
 
 def show_text(observation_id: str) -> str:

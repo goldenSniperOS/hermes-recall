@@ -1451,9 +1451,10 @@ class RecallProvider(MemoryProvider):
             return catalog
         with self._catalog_lock:
             if self._catalog is None:
-                self._catalog = mcp_proxy.build_catalog(
-                    self._config, host_hermes_home(self._hermes_home)
-                )
+                home = host_hermes_home(self._hermes_home)
+                self._catalog = mcp_proxy.build_catalog(self._config, home)
+                logger.debug("recall: tools from %s", self._catalog.label())
+                mcp_proxy.write_tool_source(home, self._catalog)
             return self._catalog
 
     def _mcp_proxy(self, catalog: mcp_proxy.ToolCatalog) -> mcp_proxy.McpProxy:
@@ -1775,12 +1776,17 @@ class RecallProvider(MemoryProvider):
                 if foreign:
                     return f"🧠 Recall — Engram server not used (foreign instance): {foreign}"
                 return tools_module.observation_report(target._client, argument)
+            home = resolve_hermes_home(target._hermes_home)
+            catalog = target._catalog
             return tools_module.status_report(
                 target._client,
-                resolve_hermes_home(target._hermes_home),
+                home,
                 project=target._project,
                 recall_count=target._last_recall_count if target._session_id else None,
                 server_status=target._server_status,
+                tools_label=catalog.label()
+                if catalog is not None
+                else mcp_proxy.recorded_label(home),
             )
         except Exception:
             return "🧠 Recall — status unavailable"

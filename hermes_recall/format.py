@@ -122,6 +122,7 @@ def render_status_line(
     url: str = "",
     server_origin: str = "",
     server_reason: str = "",
+    tools: str = "",
 ) -> str:
     """Render the human-facing recall status block (``hermes recall status``, ``/recall``).
 
@@ -136,12 +137,16 @@ def render_status_line(
     ``foreign``, ``external``, ``disabled``, ``unavailable``; see ``server.py``) and
     ``server_reason`` its human reason. Both are optional: without an origin the line
     reads exactly as it did before auto-start existed.
+
+    ``tools`` names where the model's memory tools come from (Engram's MCP or the
+    HTTP fallback); the line appears only when it is given.
     """
     try:
         lines = [
             "🧠 Recall — Engram memory provider",
             f"  project:      {_or_unknown(project)}",
             f"  server:       {_server_verdict(url, server_ok, server_origin, server_reason)}",
+            *([f"  tools:        {tools}"] if tools else []),
             f"  last error:   {_or_unknown(last_error)}",
             f"  last memory:  {_memory_label(last_memory_id)}",
             f"  last action:  {_or_unknown(last_action)}",
