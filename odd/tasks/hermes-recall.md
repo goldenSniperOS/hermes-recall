@@ -243,6 +243,78 @@ writers; done inline, test-first, in ~400-line commits.
   3b82722; `memory status` shows recall active, `recall status` reachable. The
   running Hermes gateway loads it after the owner's /restart.
 
+## v0.5.0 — Proxy Engram's official MCP tools (full parity)
+
+recall stops hand-writing `mem_*` tools. It runs its own `engram mcp --tools=agent`
+(stdio, stdlib client), publishes the upstream tool schemas as they are, and injects
+the Engram session and project it owns into every call. recall keeps owning the
+phases (recall, capture, session lifecycle, compaction, server auto-start). Evidence:
+spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architecture`).
+
+### Specs
+
+- S9 Tool source: the model gets exactly the tools `engram mcp --tools=agent` lists
+  (23 on Engram 3.6.0), with upstream names, descriptions and input schemas mapped to
+  Hermes `{name, description, parameters}`. Default is all of them ("Sí, los 23
+  completos por defecto"). `memory.recall.tools` may hold an allowlist of names.
+  `get_tool_schemas` stays cheap and side-effect free on repeat calls (cache).
+- S10 Proxy calls: `handle_tool_call` forwards `tools/call` to one long-lived MCP child
+  owned by the provider, serialized, with a per-call timeout; the result is the
+  upstream result (structured content or text) as JSON; `isError` becomes
+  `{"error": ...}` with upstream's text. A dead child is restarted at most once per
+  provider instance. The child is stopped on `shutdown`; `engram serve` is never
+  stopped.
+- S11 Injection (spike map): `session_id` = recall's effective Engram session
+  (registered first, like v0.4 saves) on every tool whose schema has `session_id`;
+  `project` = detected project when the schema has `project` and the model gave none;
+  `cwd` = working directory for `mem_current_project` when absent. A model-supplied
+  `session_id` is replaced. When the model names a different `project` on a write,
+  `session_id` is not injected (no `session_project_mismatch`). `expected_project`
+  is never injected. `mem_session_start` / `mem_session_end` are bound to recall's
+  session (inspect their schemas; decide and log).
+- S12 Write gate: subagent, cron and flush contexts may call only read tools (an
+  explicit read allowlist); any other or future tool counts as a write and is refused
+  without starting or calling the child.
+- S13 Side effects kept from v0.4: `🧠 saved #id`-style status and `state.json` last id
+  from results that carry an observation id; a successful or uncertain
+  `mem_session_finalize` and an MCP `mem_session_end` suppress the hook's `/end` and
+  the next write resumes (`:resume:N`); private tags redacted before forwarding
+  free-text write fields.
+- S14 Fallback: when the proxy cannot serve (no `engram` binary, `ENGRAM_URL` set or
+  `memory.recall.url` not the local default — the MCP opens the local SQLite, so a
+  remote server must never be paired with it —, foreign instance, child fails to
+  start or list tools), recall serves the v0.4 HTTP tool set unchanged.
+  `hermes recall status` / `/recall` say which source is active.
+- S15 Docs: README tools section, design doc, install prompt (Engram MCP in Hermes is
+  now redundant: recommend `hermes mcp remove engram`), CHANGELOG 0.5.0, version bump.
+
+### Tasks
+
+- [ ] T19 S9+S10 stdio MCP client + schema discovery/cache + proxy dispatch, child
+      lifecycle. Route: delegated (gentle-ai-worker), test-first with a fake MCP child.
+- [ ] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
+- [ ] T21 S14 fallback + status line. Route: same worker.
+- [ ] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
+- [ ] T23 Verify (independent: concurrency + write gate are high risk), real Engram
+      3.6.0 isolated smoke of all 23 tools' binding, release v0.5.0, live install,
+      remove the Engram MCP from Hermes. Route: parent.
+
+### Log
+
+- L16 (2026-10-28, owner): "Una consulta pero dime una cosa porque es que no tenemos
+  ninguno de los comandos de MCP de Engram? en hermes-recall? se supone que debería
+  conectarse a engram y hacer todo esto. no veo porque no tener ese poder en hermes.
+  Es un agente igual y debería hacer esos llamados de "mem_*" y hermes-recall solo
+  debe asegurarse de que en que fase debe hacerse."
+- L17 (owner): "gentle-engram cambia cada semana y trae cosas nuevas. No quiero dejar de
+  usarlo. hay otros mantainers que manejan eso. [...] yo quiero tener paridad completa
+  de uso. no quiero construir Gentle Engram dentro de hermes-recall."
+- L18 Evidence: Hermes' own Engram MCP cannot bind sessions (one process per Hermes,
+  fixed cwd, no TERMINAL_CWD, no per-call arg rewrite). Spike: injected
+  `session_id`+`project` lands in the HTTP-registered session; plain MCP lands in
+  `manual-save-<cwd basename>` of the wrong project. Agent profile: 23 tools, 30.4 KB.
+- L19 (owner, choice): "Sí, los 23 completos por defecto" — proxy, all tools by default.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
