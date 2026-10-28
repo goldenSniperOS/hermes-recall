@@ -285,6 +285,27 @@ def test_autostart_is_independent_of_enabled(monkeypatch: pytest.MonkeyPatch) ->
     assert config.autostart is False
 
 
+# -- tools allowlist ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ()),  # absent -> every tool
+        ([], ()),
+        ("", ()),
+        (["mem_save", " mem_search ", "mem_save", "", 3], ("mem_save", "mem_search")),
+        ("mem_save, mem_search,,mem_save", ("mem_save", "mem_search")),
+        (42, ()),  # wrong type -> every tool
+    ],
+)
+def test_tools_allowlist_coercion(monkeypatch: pytest.MonkeyPatch, raw: Any, expected: Any) -> None:
+    clear_env(monkeypatch)
+    stub_hermes_config(monkeypatch, {"tools": raw} if raw is not None else {})
+
+    assert load_config().tools == expected
+
+
 # -- project_override ---------------------------------------------------------
 
 

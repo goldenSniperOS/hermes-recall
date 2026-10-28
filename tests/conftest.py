@@ -30,6 +30,9 @@ ensure_repo_on_path()
 # lives beside this file, which is on ``sys.path`` because pytest puts a
 # conftest's own directory there when it imports it.
 from fake_engram import FakeEngram  # noqa: E402
+from fake_mcp import FakeMcp  # noqa: E402
+
+from hermes_recall import mcp_proxy  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -42,13 +45,17 @@ def _never_reach_the_real_engram(
     address a plain ``engram serve`` would bind, which follows ``ENGRAM_PORT``. Port 1
     is never what a test config points at, so the default URL can never match; tests
     that exercise auto-start set ``ENGRAM_PORT`` to their own free port. ``ENGRAM_BIN``
-    points at a path that does not exist, so the real binary is never run, and an
-    ambient ``ENGRAM_URL`` would turn every auto-start test into a no-op.
+    points at a path that does not exist, so the real binary is never run (and the
+    MCP proxy falls back to the HTTP tools), and an ambient ``ENGRAM_URL`` would turn
+    every auto-start test into a no-op. ``HERMES_HOME`` points at a scratch
+    directory, so a provider asked for tool schemas before ``initialize`` never
+    writes under the user's ``~/.hermes``.
     """
     monkeypatch.setenv("ENGRAM_PORT", "1")
     missing = tmp_path_factory.getbasetemp() / "no-such-engram-binary"
     monkeypatch.setenv("ENGRAM_BIN", str(missing))
     monkeypatch.delenv("ENGRAM_URL", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.getbasetemp() / "hermes-home"))
 
 
 @pytest.fixture(scope="session")
@@ -69,3 +76,34 @@ def fake_engram() -> Iterator[FakeEngram]:
         yield server
     finally:
         server.stop()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_mcp_discovery(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """No MCP tool discovery leaks between tests through the in-process cache.
+
+    The proxy's bounds shrink too, so a test that hangs the fake child waits seconds,
+    not the production timeouts.
+    """
+    mcp_proxy.clear_discovery_cache()
+    monkeypatch.setattr(mcp_proxy, "CALL_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(mcp_proxy, "START_TIMEOUT_S", 5.0)
+    yield
+    mcp_proxy.clear_discovery_cache()
+
+
+@pytest.fixture
+def hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A Hermes home of the test's own, also what ``HERMES_HOME`` names."""
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def fake_mcp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeMcp:
+    """The fake ``engram`` MCP binary, installed as ``ENGRAM_BIN``."""
+    fake = FakeMcp(tmp_path / "bin")
+    monkeypatch.setenv("ENGRAM_BIN", str(fake.binary))
+    return fake

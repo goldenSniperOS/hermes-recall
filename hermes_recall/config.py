@@ -55,6 +55,13 @@ class RecallConfig:
     is on (no ``ENGRAM_URL``, default loopback address only, never kill).
     """
 
+    tools: tuple[str, ...] = ()
+    """Allowlist of Engram MCP tool names to expose; empty means every listed tool.
+
+    ``memory.recall.tools`` as a YAML list or a comma-separated string. Names are
+    stripped and de-duplicated in order; a name Engram does not list is ignored.
+    """
+
 
 def _load_recall_settings() -> dict[str, Any]:
     """Return the ``memory.recall`` block from the Hermes config (``{}`` on any error).
@@ -150,6 +157,26 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
     return default
 
 
+def _coerce_names(value: Any) -> tuple[str, ...]:
+    """Coerce a list (or comma-separated string) of tool names to a clean tuple.
+
+    Anything else, and every non-string entry, is ignored: an unreadable allowlist
+    means "no allowlist", never "no tools".
+    """
+    if isinstance(value, str):
+        items: list[Any] = value.split(",")
+    elif isinstance(value, list | tuple):
+        items = list(value)
+    else:
+        return ()
+    names: list[str] = []
+    for item in items:
+        name = item.strip() if isinstance(item, str) else ""
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
 def load_config() -> RecallConfig:
     """Resolve provider settings with precedence: environment > Hermes config > default.
 
@@ -185,6 +212,7 @@ def load_config() -> RecallConfig:
             enabled=_coerce_bool(settings.get("enabled"), default=True),
             auth_token=os.environ.get("ENGRAM_HTTP_TOKEN", "").strip(),
             autostart=_coerce_bool(settings.get("autostart"), default=True),
+            tools=_coerce_names(settings.get("tools")),
         )
     except Exception:
         return RecallConfig(
@@ -214,3 +242,21 @@ def resolve_hermes_home(explicit: str = "") -> str:
         return os.path.join(os.path.expanduser("~"), ".hermes")
     except Exception:
         return os.path.join("~", ".hermes")
+
+
+def host_hermes_home(explicit: str = "") -> str:
+    """The Hermes home before ``initialize`` has named it: ``explicit``, else the host's.
+
+    Hermes asks for tool schemas before it initializes the provider, so the profile
+    home is not known yet. The host's own resolver (profile override, then
+    ``HERMES_HOME``) is asked when it is importable; otherwise
+    :func:`resolve_hermes_home`. Never raises.
+    """
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:
+        return resolve_hermes_home()
