@@ -290,7 +290,7 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
 
 ### Tasks
 
-- [ ] T19 S9+S10 stdio MCP client + schema discovery/cache + proxy dispatch, child
+- [x] T19 S9+S10 stdio MCP client + schema discovery/cache + proxy dispatch, child
       lifecycle. Route: delegated (gentle-ai-worker), test-first with a fake MCP child.
 - [ ] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
 - [ ] T21 S14 fallback + status line. Route: same worker.
@@ -314,6 +314,35 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   `session_id`+`project` lands in the HTTP-registered session; plain MCP lands in
   `manual-save-<cwd basename>` of the wrong project. Agent profile: 23 tools, 30.4 KB.
 - L19 (owner, choice): "Sí, los 23 completos por defecto" — proxy, all tools by default.
+- L20 Decision (T19, worker): Hermes calls `get_tool_schemas` in `add_provider`, before
+  `initialize` (agent_init.py `_init_memory`, memory_manager.py `add_provider`), and
+  builds its tool routing table from that first answer. So discovery is synchronous on
+  the first call: a short-lived child (spawn, `tools/list`, stop), cached in-process per
+  binary and on disk in `<hermes_home>/recall/mcp-tools.json` (home from the host's
+  `get_hermes_home` before `initialize`). The cache key is the binary's resolved path,
+  size and mtime rather than the version string, which would cost a process on every
+  start; the version (from `serverInfo`) is stored beside it. Failures are cached
+  in-process only. The tool source is fixed per provider instance.
+- L21 Decision (T19, worker): the call child starts on the first proxied call, in the
+  working directory (`TERMINAL_CWD`, else cwd) so Engram's own cwd fallback matches the
+  session, its own session on POSIX (a Ctrl-C on the turn must not kill it), the
+  inherited environment unchanged, stderr to `<hermes_home>/recall/engram-mcp.log`.
+  Bounds: start 5 s, call 20 s, stop 1 s; a caller waits for the lock at most
+  start + call + 2 x stop. A watchdog kills a silent child (also unblocking a write on a
+  full pipe). A child found dead before a call is restarted (the one restart); a call
+  that died after it was sent is never retried and says it may have been applied. Once
+  the restart is spent, proxied calls return an error (no per-call HTTP fallback).
+- L22 Decision (T19, worker): result mapping. `structuredContent` wins; else the text
+  items joined, as a JSON object when they parse as one, else `{"result": text}`. An
+  `isError` JSON body becomes `{"error": message, ...its other fields}` (`error_code`,
+  `hint`, `available_projects`); a JSON-RPC error becomes
+  `{"error": "Engram MCP refused <tool>: <message>"}`.
+- L23 Decision (T19, worker): `memory.recall.tools` takes a YAML list or a
+  comma-separated string, ignores names Engram does not list, keeps upstream order, and
+  also filters the HTTP fallback tools.
+- L24 Delivery (T19): the work unit is two commits over the ~400-line guide:
+  45fa1cd (discovery, 1037 lines: 365 are the fake MCP child, 118 tests) and 9737aa9
+  (dispatch and lifecycle, 781 lines: ~430 tests).
 
 ## Acceptance criteria
 
@@ -410,6 +439,9 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 - T17 protocol text, docs, CHANGELOG, v0.4.0 bump: `a8f3d14` (Pi gentle-ai-worker,
   test-first). Branch `feat/engram-3.6-additions`: 828 tests, ruff clean; not
   pushed or tagged. T18 (live 3.6.0 smoke, review, release) is next.
+
+- T19 stdio MCP client, discovery and schema cache, proxy dispatch, child lifecycle:
+  `45fa1cd` + `9737aa9` (Pi gentle-ai-worker, test-first with a fake MCP child).
 
 ## Next step
 
