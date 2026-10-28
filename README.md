@@ -19,8 +19,9 @@ Independent community project; see [Not affiliated](#not-affiliated).
 ## Why
 
 When Engram is only connected to Hermes as an MCP server, the model decides
-whether to search memory. It often starts working without any recall, and
-every API call carries ~19 Engram tool schemas.
+whether to search memory. It often starts working without any recall, and that
+MCP server cannot know which Hermes session or directory a call belongs to, so
+saves land in a session of the wrong project.
 
 hermes-recall makes memory **deterministic**:
 
@@ -33,12 +34,13 @@ hermes-recall makes memory **deterministic**:
 | Subagent results capture | When a subagent finishes | Hermes |
 | Compaction archive + recovery context | Before context compression | Hermes |
 | Session start / end | Session boundaries | Hermes |
-| `mem_save`, `mem_search`, ... | When the model wants them | The model |
+| Engram's own MCP tools (`mem_save`, `mem_search`, ...), bound to the session | When the model wants them | The model |
 
 It talks to the same local Engram server (`engram serve`) as every other
 agent, so memories, projects and ids are shared: a memory saved from Hermes
 shows up in Pi, OpenCode or Claude Code with the same `#id`, and the other
-way around.
+way around. The model's memory tools are Engram's own (`engram mcp`), so a new
+Engram release brings its new tools to Hermes without a hermes-recall release.
 
 ## Requirements
 
@@ -49,10 +51,12 @@ way around.
   brew install gentleman-programming/tap/engram
   ```
 
-  Tested with Engram 2.0.0, 3.0.0 and 3.6.0. `mem_consolidate`, `mem_judge_many`,
-  `mem_session_finalize`, observation history and compact search need Engram
-  >= 3.5.1; on an older server those tools say so and everything else keeps
-  working. You no longer need to start `engram serve` by hand: when no server answers, hermes-recall starts one for you (see
+  Tested with Engram 2.0.0, 3.0.0 and 3.6.0. The memory tools come from this
+  binary (`engram mcp --tools=agent`); without it hermes-recall falls back to its
+  own HTTP tools (see [Memory tools](#memory-tools)). On that fallback,
+  `mem_consolidate`, `mem_judge_many`, `mem_session_finalize`, observation
+  history and compact search need Engram >= 3.5.1; on an older server those
+  tools say so and everything else keeps working. You no longer need to start `engram serve` by hand: when no server answers, hermes-recall starts one for you (see
   [Engram server](#engram-server)).
 
 ## Install
@@ -83,8 +87,9 @@ built-in memory only with `hermes memory off`.
 ### Engram MCP server
 
 If you registered Engram as an MCP server before (`hermes mcp add engram ...`),
-you can keep it, but hermes-recall already exposes the memory tools, so the
-MCP tools are duplicates that cost tokens on every call. To remove them:
+remove it: hermes-recall now runs the same Engram MCP tools itself and binds
+every call to the Hermes session and project, so the separate server only adds
+duplicate tools (tokens on every call) that save into the wrong session:
 
 ```bash
 hermes mcp remove engram
@@ -99,7 +104,29 @@ with a line such as:
 🧠 Recall · my-project — recalled 3 memories
 ```
 
-The model gets these tools (compact schemas, about 5.5 KB in total):
+### Memory tools
+
+The model gets exactly the tools `engram mcp --tools=agent` lists, with
+Engram's own names, descriptions and parameters: 23 on Engram 3.6.0
+(`mem_search`, `mem_save`, `mem_update`, `mem_get_observation`, `mem_context`,
+`mem_session_summary`, `mem_session_finalize`, `mem_consolidate`,
+`mem_judge_many`, `mem_search_prompts`, `mem_doctor`, ...; about 27 KB of
+schemas). hermes-recall runs that MCP server itself, one process per session,
+and fills in what it owns on every call:
+
+- `session_id`: the Hermes session, registered with Engram first (or its
+  `:resume:N` continuation after a finalize), whatever the model sent.
+- `project`: the detected project, when the model gives none.
+- `cwd`: the working directory, for `mem_current_project`.
+
+`mem_session_start` reports that session instead of creating another one, and
+`mem_session_end` / `mem_session_finalize` end it (the session end hook then
+does not end it again). Use `memory.recall.tools` to publish fewer tools.
+
+When the proxy cannot serve — `ENGRAM_URL` is set, `memory.recall.url` is not
+the local default address (the MCP server opens the local store directly, so it
+is never paired with another server), or there is no `engram` binary —
+hermes-recall serves its own HTTP tools instead (compact schemas, about 5.5 KB):
 
 | Tool | Engram endpoint |
 |---|---|
@@ -116,16 +143,24 @@ The model gets these tools (compact schemas, about 5.5 KB in total):
 | `mem_judge_many` | `POST /conflicts/judge-many` (Engram >= 3.5.1) |
 | `mem_session_finalize` | `POST /sessions/{id}/finalize` (Engram >= 3.5.1) |
 
+`/recall` and `hermes recall status` say which tools are active, for example
+`tools: Engram MCP, 23 tools (Engram 3.6.0)` or
+`tools: HTTP fallback, 13 tools: ENGRAM_URL is set; ...`.
+
 Every write result carries a `status` such as `🧠 saved #761`, and the last
 memory id is kept in `<hermes_home>/recall/state.json`, so you can always get
 back to it:
 
 - `/recall` in any chat, or `hermes recall status` in a terminal: project,
-  Engram health, last memory id and action, last recall count.
+  Engram health, memory tools source, last memory id and action, last recall
+  count.
 - `/recall <id>` or `hermes recall show <id>`: title, type, date and the first
   800 characters of that memory.
 
-Subagents, cron jobs and memory flushes read memory but never write it.
+Subagents, cron jobs and memory flushes read memory but never write it: they
+may call only `mem_search`, `mem_search_prompts`, `mem_context`,
+`mem_get_observation`, `mem_current_project`, `mem_list_projects`,
+`mem_suggest_topic_key` and `mem_doctor`; every other tool is refused.
 
 ### Engram server
 
@@ -182,6 +217,7 @@ All settings are optional:
 | `memory.recall.recall_max_chars` | `2500` | Cap on the injected recall block. |
 | `memory.recall.enabled` | `true` | `false` turns recall, capture and tools off without uninstalling. |
 | `memory.recall.autostart` | `true` | Start `engram serve` when no server answers. `false` never starts one. Ignored when `ENGRAM_URL` is set. |
+| `memory.recall.tools` | all | Allowlist of memory tool names to give the model, as a list (`[mem_search, mem_save]`) or a comma-separated string. Empty means every tool Engram lists. |
 
 ```bash
 hermes config set memory.recall.recall_limit 8

@@ -11,7 +11,7 @@ applies to it:
 | Starting point | What changes for you |
 |---|---|
 | **A. No Engram** (the `engram` binary is missing) | The agent installs Engram, installs the plugin and selects it as the memory provider. hermes-recall starts `engram serve` by itself on the next session. |
-| **B. Engram already used by Hermes as an MCP server** (`hermes mcp list` shows `engram`) | Same as A without the binary install. The agent asks you whether to remove the Engram MCP server, since hermes-recall already provides the memory tools. Your other agents are not touched. |
+| **B. Engram already used by Hermes as an MCP server** (`hermes mcp list` shows `engram`) | Same as A without the binary install. The agent recommends removing the Engram MCP server and asks you first: hermes-recall now serves the same Engram MCP tools itself, bound to the Hermes session, so the separate server is redundant. Your other agents are not touched. |
 | **C. Another memory provider is active** (`hermes memory status` shows a provider other than `recall`) | Hermes runs one external memory provider at a time. Selecting `recall` replaces the current one, so the agent asks you before switching. Nothing is deleted: you can switch back with `hermes config set memory.provider <old name>`. |
 
 You can tell the starting points apart with:
@@ -69,8 +69,11 @@ STEP 3 - Select the provider (in starting point C, ask me first):
   `hermes plugins enable` for it.
 
 STEP 4 - Engram MCP server (starting point B only, ask me first):
-  hermes-recall exposes mem_search, mem_save and the other memory tools, so
-  the Engram MCP tools are duplicates that cost tokens on every call.
+  hermes-recall runs Engram's own MCP tools itself (mem_search, mem_save and
+  the rest, from `engram mcp --tools=agent`) and binds every call to the
+  Hermes session and project. A separate Engram MCP server in Hermes is
+  therefore redundant: its tools are duplicates that cost tokens on every
+  call and write to a session of the wrong directory. Recommend removing it.
   If I agree: hermes mcp remove engram
 
 STEP 5 - Restart so the provider loads.
@@ -80,7 +83,10 @@ STEP 5 - Restart so the provider loads.
 
 STEP 6 - After the restart (I will message you again):
   - Run `hermes memory status` and show me the provider line.
-  - Run `hermes recall status` and show me the output.
+  - Run `hermes recall status` and show me the output. Its "tools:" line
+    should read "Engram MCP, N tools (Engram <version>)"; "HTTP fallback"
+    means the Engram binary or the local default address is missing, and
+    the line says why.
   - Ask me something that needs memory (for example "what did we do last
     time on this project?"). The reply should start with a line like
     "🧠 Recall · <project> — recalled N memories" when there are hits.
@@ -94,5 +100,8 @@ still pending.
 
 - Update later with `hermes plugins update recall`, then restart.
 - `hermes recall status` (or `/recall` in a chat) shows the project, the
-  Engram health, the last memory id and the last recall count.
+  Engram health, where the memory tools come from, the last memory id and the
+  last recall count.
+- `hermes config set memory.recall.tools '[mem_search, mem_save]'` limits the
+  memory tools the model gets (all of them by default).
 - To go back to built-in memory only: `hermes memory off`.

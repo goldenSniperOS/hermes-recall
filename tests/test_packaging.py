@@ -106,19 +106,34 @@ def test_register_is_callable_and_reexported_by_root_init() -> None:
     assert '__all__ = ["__version__", "register"]' in ROOT_INIT
 
 
-def test_manifest_provides_tools_matches_the_tool_schemas() -> None:
+def test_manifest_provides_tools_lists_every_tool_the_provider_can_publish() -> None:
+    # The live list comes from the installed engram (`engram mcp --tools=agent`), so
+    # the manifest names what a default install publishes: Engram 3.6.0's agent tools
+    # in upstream order, then the one HTTP-fallback tool the agent profile lacks.
+    from fake_mcp import AGENT_TOOL_NAMES
+
     from hermes_recall.tools import get_tool_schemas
 
     lines = MANIFEST.splitlines()
     assert "provides_tools:" in lines, "plugin.yaml has no block-style provides_tools list"
     listed: list[str] = []
     for line in lines[lines.index("provides_tools:") + 1 :]:
+        if line.strip().startswith("#"):
+            continue
         item = re.fullmatch(r"\s+-\s*(\S+)\s*", line)
         if not item:
             break
         listed.append(item.group(1))
-    assert listed == [schema["name"] for schema in get_tool_schemas()]
-    assert len(listed) == 13
+    assert listed == [*AGENT_TOOL_NAMES, "mem_timeline"]
+    assert {schema["name"] for schema in get_tool_schemas()} <= set(listed)
+
+
+def test_manifest_documents_the_tools_allowlist() -> None:
+    block = MANIFEST.split("config_schema:", 1)[1].split("provides_tools:", 1)[0]
+    match = re.search(r"(?m)^  tools:\n    type: (\S+)\n    default: (.+)\n", block)
+    assert match, "config_schema has no tools entry"
+    assert match.group(1) == "list"
+    assert match.group(2).strip() == "[]"
 
 
 def test_root_cli_exposes_the_loader_hooks() -> None:

@@ -1,12 +1,13 @@
 name: recall
-version: 0.4.0
+version: 0.5.0
 manifest_version: 1
 kind: exclusive
 description: >-
   Engram-compatible memory provider for Hermes Agent: deterministic recall before
   every turn, passive capture after it, session lifecycle and compaction recovery
-  against a local Engram HTTP server. Independent community project; not
-  affiliated with or endorsed by Engram or Gentleman Programming.
+  against a local Engram HTTP server, and Engram's own MCP tools bound to the
+  session. Independent community project; not affiliated with or endorsed by
+  Engram or Gentleman Programming.
 author: goldenSniperOS
 license: MIT
 homepage: https://github.com/goldenSniperOS/hermes-recall
@@ -39,17 +40,35 @@ config_schema:
     type: bool
     default: true
     description: "Start a detached engram serve when no Engram server answers at the default local address. Never used when ENGRAM_URL is set; the server is never stopped."
+  tools:
+    type: list
+    default: []
+    description: "Names of the Engram MCP tools to give the model (for example [mem_search, mem_save]). Empty means every tool `engram mcp --tools=agent` lists. Also filters the HTTP fallback tools."
+# The tools come from the installed engram (`engram mcp --tools=agent`) at runtime:
+# this list is what a default install publishes on Engram 3.6.0, plus mem_timeline,
+# which only the HTTP fallback (ENGRAM_URL set, no engram binary) serves.
 provides_tools:
-  - mem_search
-  - mem_save
-  - mem_update
-  - mem_get_observation
-  - mem_context
-  - mem_session_summary
-  - mem_timeline
-  - mem_judge
-  - mem_pin
-  - mem_unpin
+  - mem_capture_passive
+  - mem_compare
   - mem_consolidate
+  - mem_context
+  - mem_current_project
+  - mem_doctor
+  - mem_get_observation
+  - mem_judge
   - mem_judge_many
+  - mem_list_projects
+  - mem_pin
+  - mem_review
+  - mem_save
+  - mem_save_prompt
+  - mem_search
+  - mem_search_prompts
+  - mem_session_end
   - mem_session_finalize
+  - mem_session_start
+  - mem_session_summary
+  - mem_suggest_topic_key
+  - mem_unpin
+  - mem_update
+  - mem_timeline

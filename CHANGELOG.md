@@ -6,6 +6,49 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-28
+
+The model's memory tools are now Engram's own MCP tools, proxied with the
+session and project recall owns. recall keeps owning the phases: recall before
+the turn, capture after it, session lifecycle, compaction and the server
+auto-start.
+
+### Added
+
+- The model gets exactly the tools `engram mcp --tools=agent` lists (23 on Engram
+  3.6.0) with upstream names, descriptions and parameters, so every Engram
+  release's tools reach Hermes without a recall release. The list is discovered
+  once per Engram binary and cached in `<hermes_home>/recall/mcp-tools.json`.
+- Calls go to one long-lived `engram mcp` child per provider: one call at a time,
+  20 s per call, a silent child is killed and restarted once, a sent call is never
+  retried, and the child is stopped on exit (`engram serve` never is).
+- Every call is bound to recall's session: `session_id` is the registered (or
+  resumed) Engram session, `project` the detected project when the model gives
+  none, `cwd` the working directory for `mem_current_project`. `mem_session_start`
+  reports recall's session; `mem_session_end` and `mem_session_finalize` end it,
+  and the next write lands in a resumed continuation.
+- `memory.recall.tools`: an allowlist of tool names to publish.
+- `/recall` and `hermes recall status` show a `tools:` line: Engram MCP (with
+  the Engram version) or the HTTP fallback and why.
+
+### Changed
+
+- Subagents, cron jobs and memory flushes may call only the read tools
+  (`mem_search`, `mem_search_prompts`, `mem_context`, `mem_get_observation`,
+  `mem_current_project`, `mem_list_projects`, `mem_suggest_topic_key`,
+  `mem_doctor`); any other tool, including a new upstream one, is refused.
+- The tool schemas are larger (about 27 KB for the 23 tools on Engram 3.6.0,
+  against about 5.5 KB before); `memory.recall.tools` trims them.
+- The Engram MCP server registered in Hermes (`hermes mcp add engram`) is now
+  fully redundant; remove it with `hermes mcp remove engram`.
+
+### Kept
+
+- The v0.4 HTTP tools are served unchanged when the proxy cannot serve:
+  `ENGRAM_URL` set, `memory.recall.url` not the local default address (the MCP
+  opens the local store directly, so it is never paired with another server), no
+  `engram` binary, or a binary that cannot list its tools.
+
 ## [0.4.0] - 2026-10-27
 
 Engram 3.6.0 additions (gentle-engram 0.5 parity). Every new route degrades on

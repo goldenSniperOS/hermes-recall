@@ -13,7 +13,8 @@ and import-safe.
 
 Commands:
 
-* ``hermes recall status`` — the same status block as ``/recall``.
+* ``hermes recall status`` — the same status block as ``/recall``, including where
+  the memory tools come from (Engram MCP or the HTTP fallback, as last recorded).
 * ``hermes recall show <id>`` — the same detail view as ``/recall <id>``.
 """
 
@@ -84,7 +85,9 @@ def recall_command(args: Any) -> int:
 def register_cli(subparser: Any) -> None:
     """Build the ``hermes recall`` argparse tree."""
     subs = subparser.add_subparsers(dest="recall_action")
-    subs.add_parser("status", help="Show Engram recall status and the last memory id")
+    subs.add_parser(
+        "status", help="Show Engram recall status, the memory tools source and the last memory id"
+    )
     show = subs.add_parser("show", help="Show one Engram observation")
     show.add_argument("id", help="Observation id, e.g. 761")
     subparser.set_defaults(func=recall_command)

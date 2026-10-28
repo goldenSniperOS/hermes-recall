@@ -9,16 +9,22 @@ that makes a local Engram HTTP server (`engram serve`, default
 ```
 Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
                                    │  recall / capture / lifecycle
-                                   │  tools ──▶ tools.py ──▶ state.py (state.json)
+                                   │  tools ──▶ mcp_proxy.py ──stdio──▶ engram mcp --tools=agent
+                                   │      (fallback) tools.py
+                                   │  status line, last id ──▶ state.py (state.json)
                                    ▼
-                              EngramClient (client.py) ──HTTP──▶ Engram
+                              EngramClient (client.py) ──HTTP──▶ engram serve
 ```
+
+Both Engram processes open the same local store: the HTTP server recall talks to
+for the phases, and the MCP child recall owns for the model's tools.
 
 | Module | Role |
 | --- | --- |
 | `hermes_recall/provider.py` | `RecallProvider`: every `MemoryProvider` hook, the background worker, `/recall` handler |
 | `hermes_recall/client.py` | Fail-soft HTTP client: short timeouts, `None`/`[]`/`""` on failure, per-thread `last_error_text()` |
-| `hermes_recall/tools.py` | The 10 `mem_*` schemas, their handlers, and the shared status/detail reports |
+| `hermes_recall/mcp_proxy.py` | Engram MCP proxy: stdio JSON-RPC child, tool discovery and cache, bindings helpers, `tools.json` |
+| `hermes_recall/tools.py` | The v0.4 HTTP `mem_*` tools (the S14 fallback), and the shared status/detail reports |
 | `hermes_recall/state.py` | The stable `state.json` contract (`read_state`, `write_state`) |
 | `hermes_recall/format.py` | Pure rendering: recall block, status block, observation detail, `🧠` status strings |
 | `hermes_recall/config.py` | Settings (`ENGRAM_URL` > `memory.recall.*` > defaults), Hermes home resolution |
@@ -27,6 +33,9 @@ Hermes MemoryManager ──hooks──▶ RecallProvider (provider.py)
 | `cli.py` (root) | `hermes recall status` / `hermes recall show <id>` |
 
 ### Hooks and tools → Engram endpoints
+
+The `mem_*` rows below are the HTTP fallback tool set (see "Engram MCP proxy" for
+when it is served); the proxied tools are Engram's own MCP handlers.
 
 | Hermes surface | Engram endpoint | Notes |
 | --- | --- | --- |
@@ -99,6 +108,91 @@ the preview) is an error carrying the fresh `plan`; it is never confirmed
 automatically. A confirmation that timed out or got a 5xx may have been applied,
 so the error says the outcome is unknown and asks the model to check the source
 ids instead of retrying.
+
+## Engram MCP proxy (tools)
+
+Since 0.5.0 the model's memory tools are Engram's own MCP tools. recall runs its own
+`engram mcp --tools=agent` (stdio, newline-delimited JSON-RPC), publishes the tools
+it lists as Hermes `{name, description, parameters}` (`inputSchema` as is;
+`annotations` and `defer_loading` are dropped) and forwards each call as
+`tools/call`, injecting the session and project recall owns. recall keeps the
+phases (recall, capture, lifecycle, compaction, server auto-start).
+
+### Discovery and cache
+
+Hermes calls `get_tool_schemas` inside `MemoryManager.add_provider`, **before**
+`initialize`, and routes tool calls by that first answer. So the first call decides
+the tool source for the provider instance and discovers synchronously: a short-lived
+child (spawn, `initialize`, `tools/list` with paging, stop; about 55 ms on Engram
+3.6.0), bounded by 5 s. The list is cached in-process per binary and in
+`<hermes_home>/recall/mcp-tools.json` (home from the host's `get_hermes_home`, since
+`initialize` has not named it yet). The cache key is the binary's resolved path,
+size and mtime: an upgrade changes it without a process per start. Failures are
+cached in-process only. `memory.recall.tools` filters the list (and the fallback).
+
+### Calls
+
+| Rule | Value |
+| --- | --- |
+| Child | One per provider, started on the first proxied call, in the working directory (`TERMINAL_CWD`, else cwd), own session on POSIX, inherited environment, stderr to `<hermes_home>/recall/engram-mcp.log` |
+| Serialization | One call at a time behind a lock; a caller waits at most start + call + 2 × stop |
+| Per-call bound | 20 s; a watchdog kills a silent child (also unblocking a write on a full pipe) |
+| Restart | A child found dead (exited, crashed, killed by the watchdog) is replaced once per provider instance; after that calls return an error |
+| Retry | Never for a call that was sent; it reports that it may have been applied |
+| Shutdown | `shutdown` stops the child without waiting for an in-flight call; `engram serve` is never stopped |
+| Result | `structuredContent`, else the text items as a JSON object, else `{"result": text}`; `isError` → `{"error": message, ...fields}`; JSON-RPC error → `{"error": "Engram MCP refused <tool>: ..."}` |
+
+### Bindings
+
+| Argument | Injected value | When |
+| --- | --- | --- |
+| `session_id` | recall's effective Engram session (`<id>` or `<id>:resume:N`), registered first through `POST /sessions` | Schema has it, primary context, and the model named no other project (canonical names) and a registration is confirmed; the model's value is always dropped. An `unknown_session` answer re-registers and retries once |
+| `project` | the detected project (or `memory.recall.project`) | Schema has it, the model gave none, and `all_projects` is not true |
+| `cwd` | the working directory | `mem_current_project` with neither `cwd` nor `directory` |
+| `id` | recall's effective session | `mem_session_end` |
+| `expected_project` | never | — |
+
+`mem_session_start` is answered by recall and never forwarded: Engram's handler
+registers the given id under the project of the child's own cwd, while every write
+is already bound to recall's session. It registers recall's session and returns its
+effective id.
+
+### Write gate
+
+Subagent, cron and flush contexts may call only `mem_search`, `mem_search_prompts`,
+`mem_context`, `mem_get_observation`, `mem_current_project`, `mem_list_projects`,
+`mem_suggest_topic_key` and `mem_doctor`. Any other tool, including one a future
+Engram adds, is refused before the child is started or called. Such a context may
+start its own child for these reads.
+
+### Side effects
+
+- Private tags are redacted in every string of a write's arguments (only strings
+  carrying a tag are touched).
+- A result carrying an observation id gets the status line (`🧠 saved #761`, ...)
+  under `status`, or `recall_status` when Engram's payload already has `status`
+  (`mem_consolidate`); the upstream payload is otherwise unchanged. The id comes
+  from the result (`id`, a finalize's `summary_id`, a consolidation's survivor) or,
+  for `mem_update` and `mem_get_observation`, from the arguments. `state.json` moves
+  for the primary context only.
+- `mem_session_finalize` or `mem_session_end` on recall's session that succeeded, may
+  have (timeout, exit) or answered `session_already_ended` marks the session ended:
+  the hook's `/end` is not posted and the next write registers a resume continuation.
+- Proxied tool results are never passively captured.
+
+### Fallback
+
+The v0.4 HTTP tools (`tools.py`) are served unchanged when `ENGRAM_URL` is set, when
+`memory.recall.url` is not the local default address (`server.is_spawnable_url`),
+when there is no `engram` binary, or when it cannot list its tools. The MCP child
+opens the local SQLite store directly (not through `engram serve`), so it is never
+paired with any other server. A foreign instance is detected only after `initialize`,
+when the tool set is already routed: every tool call is then refused with the
+foreign reason, as the v0.4 tools do.
+
+The decision is recorded in `<hermes_home>/recall/tools.json`; `/recall` and
+`hermes recall status` show it as `tools: Engram MCP, 23 tools (Engram 3.6.0)` or
+`tools: HTTP fallback, 13 tools: <reason>`.
 
 ## System prompt (static)
 
@@ -346,8 +440,10 @@ not `hermes recall`.
 - One daemon worker thread runs every background job (session registration,
   prompt and passive capture, queued project detection, `/end`) in order, behind a
   bounded queue (256). A full queue drops the job. `shutdown()` joins for at most 2 s.
-- Tools and `on_pre_compress` run on the caller's thread. `mem_save` may register
-  the session synchronously when Engram has not seen it yet.
+- Tools and `on_pre_compress` run on the caller's thread. A write tool may register
+  the session synchronously when Engram has not seen it yet. Proxied tool calls
+  share one MCP child behind a lock, bounded per call (see "Engram MCP proxy"); the
+  hooks never use that child.
 - `queue_prefetch` does not search. Hermes calls it with the turn that just
   finished, while the next `prefetch` asks about the next message, so a recall
   computed in the background would almost never be served. It only warms project
@@ -355,10 +451,11 @@ not `hermes recall`.
 - `EngramClient.last_error_text()` is per thread, so the worker and the tool
   thread cannot overwrite each other's failure reason.
 - Non-primary `agent_context` (`subagent`, `cron`, `flush`): no capture and no
-  session writes; write tools (`mem_save`, `mem_update`, `mem_session_summary`,
-  `mem_judge`, `mem_judge_many`, `mem_consolidate`, `mem_session_finalize`,
-  `mem_pin`, `mem_unpin`) return an error. Read tools work and do not write
-  `state.json`.
+  session writes. Proxied tools: only the read allowlist is forwarded (see "Write
+  gate"). HTTP fallback tools: write tools (`mem_save`, `mem_update`,
+  `mem_session_summary`, `mem_judge`, `mem_judge_many`, `mem_consolidate`,
+  `mem_session_finalize`, `mem_pin`, `mem_unpin`) return an error. Read tools work
+  and do not write `state.json`.
 
 ## Session registration
 
