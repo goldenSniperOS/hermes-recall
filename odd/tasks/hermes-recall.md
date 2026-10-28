@@ -293,7 +293,7 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
 - [x] T19 S9+S10 stdio MCP client + schema discovery/cache + proxy dispatch, child
       lifecycle. Route: delegated (gentle-ai-worker), test-first with a fake MCP child.
 - [x] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
-- [ ] T21 S14 fallback + status line. Route: same worker.
+- [x] T21 S14 fallback + status line. Route: same worker.
 - [ ] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
 - [ ] T23 Verify (independent: concurrency + write gate are high risk), real Engram
       3.6.0 isolated smoke of all 23 tools' binding, release v0.5.0, live install,
@@ -372,6 +372,18 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   `mem_get_observation`, from the arguments. A finalize for another project (no session
   injected) leaves recall's session open. Proxied tool names join the passive-capture
   skip list. T20 is one commit of ~900 lines (~560 tests).
+- L29 Decision (T21, worker): "local default" is the address auto-start would spawn for
+  (`server.is_spawnable_url`: `http://127.0.0.1|localhost:<ENGRAM_PORT or 7437>`, no
+  path); `ENGRAM_URL` set always means fallback. A foreign instance is only known after
+  `initialize` (the `/health` identity check runs on the worker), when the host has
+  already routed the published tools, so the source cannot change then: every tool call
+  is refused with the foreign reason before the child is touched, which is what the v0.4
+  tools do against a foreign server. A stale `server.json` is not read at schema time.
+- L30 Decision (T21, worker): the decision is recorded in
+  `<hermes_home>/recall/tools.json` (`source`, `reason`, `count`, `version`, `label`)
+  when it is made, so `hermes recall status` (another process) can name it; `/recall`
+  uses the live catalog. The status block gains a `tools:` line only when a source is
+  known or asked for, so the v0.4 layout is otherwise unchanged.
 
 ## Acceptance criteria
 
@@ -472,6 +484,7 @@ Forecast: ~1200 authored lines across T1-T6 (over the 400 heuristic; explained: 
 - T19 stdio MCP client, discovery and schema cache, proxy dispatch, child lifecycle:
   `45fa1cd` + `9737aa9` (Pi gentle-ai-worker, test-first with a fake MCP child).
 - T20 injection, write gate, side effects: `fcf7aba` (Pi gentle-ai-worker, test-first).
+- T21 S14 fallback and tool-source status: `ba0d89c` (Pi gentle-ai-worker, test-first).
 
 ## Next step
 
