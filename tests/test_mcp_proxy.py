@@ -441,6 +441,28 @@ def test_shutdown_during_a_hung_call_unblocks_it(
     assert "error" in result_of(results["r"])
 
 
+def test_a_call_racing_shutdown_never_starts_a_child(
+    fake_mcp: FakeMcp, make_provider: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Shutdown lands after the call passed its early check but before the child
+    # exists: no child may be spawned once shutdown has stopped them.
+    provider = make_provider()
+    bind = provider._bind_arguments
+
+    def bind_then_shut_down(*args: Any, **kwargs: Any) -> Any:
+        bound = bind(*args, **kwargs)
+        provider.shutdown()
+        return bound
+
+    monkeypatch.setattr(provider, "_bind_arguments", bind_then_shut_down)
+
+    result = result_of(provider.handle_tool_call("mem_list_projects", {}))
+
+    assert "error" in result
+    assert len(fake_mcp.starts()) == 1
+    assert fake_mcp.calls() == []
+
+
 def test_shutdown_without_a_child_is_a_no_op(fake_mcp: FakeMcp, make_provider: Any) -> None:
     provider = make_provider()
 

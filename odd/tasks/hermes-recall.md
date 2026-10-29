@@ -400,6 +400,16 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   first half was committed; it holds only that repository source and was left in
   place (deleting is outside the worker's permissions).
 
+- L34 Evidence (T23, parent): independent verify PASS S9-S15, no blockers/majors.
+  Real Engram 3.6.0 smoke through the provider (isolated data dir, cwd /tmp,
+  TERMINAL_CWD=repo): 23 tools / 26.8 KB; a model-picked `session_id` was replaced by
+  recall's; `<private>` redacted before forwarding; finalize then save landed in
+  `<id>:resume:2`; MCP `mem_session_end` closed it; subagent write refused, read
+  served; no child left after shutdown. Fixed test-first the verifier's minor: a call
+  racing `shutdown()` could spawn a child after `_stop_mcp` (`_mcp_proxy` now checks
+  `_shutting_down` under `_mcp_lock`). Spike memory #794 was overwritten by a worker
+  upsert; restored as #796 (`hermes-recall/mcp-proxy-spike`).
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows

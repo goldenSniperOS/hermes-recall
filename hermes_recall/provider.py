@@ -1457,9 +1457,16 @@ class RecallProvider(MemoryProvider):
                 mcp_proxy.write_tool_source(home, self._catalog)
             return self._catalog
 
-    def _mcp_proxy(self, catalog: mcp_proxy.ToolCatalog) -> mcp_proxy.McpProxy:
-        """This provider's MCP proxy, created on first use (the child starts lazily)."""
+    def _mcp_proxy(self, catalog: mcp_proxy.ToolCatalog) -> mcp_proxy.McpProxy | None:
+        """This provider's MCP proxy, created on first use (the child starts lazily).
+
+        ``None`` once shutdown began. Checked under the lock :meth:`_stop_mcp` takes,
+        so a call racing shutdown either created the proxy before (and shutdown
+        closes it) or sees the flag here and never spawns a child.
+        """
         with self._mcp_lock:
+            if self._shutting_down:
+                return None
             if self._mcp is None:
                 self._mcp = mcp_proxy.McpProxy(
                     catalog.binary,
@@ -1498,6 +1505,8 @@ class RecallProvider(MemoryProvider):
             tool_name, arguments, catalog.properties(tool_name), runtime_id
         )
         proxy = self._mcp_proxy(catalog)
+        if proxy is None:
+            return tools_module.error_result("recall is shutting down")
         outcome = proxy.call(tool_name, bound)
         if (
             own_session
