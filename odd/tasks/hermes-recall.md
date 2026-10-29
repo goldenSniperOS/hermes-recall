@@ -416,6 +416,14 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   those tests only (no test measures that bound). 5 full runs with two `yes` CPU
   hogs: 919 passed each time. No deterministic RED is possible for a timing flake.
 
+- L36 Review (T23, parent): native review review-5b77ea771954853c (tier high,
+  lenses risk/resilience/reliability) approved and acknowledged (authority burned).
+  12 non-blocking advisories kept as follow-ups: R1-001 mcp_proxy.py:565-568,
+  R1-002 provider.py:1565-1567, R3-001 config.py:166-177, R3-002
+  test_mcp_proxy.py:309-312, R3-003..R3-007, R4 fingerprint stale behind shims
+  (mcp_proxy.py:354-365), restart budget never replenishes (850-856), status hides
+  a dead proxy (provider.py:1796-1798).
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
