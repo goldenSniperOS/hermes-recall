@@ -295,7 +295,7 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
 - [x] T20 S11+S12+S13 injection, write gate, side effects. Route: same worker.
 - [x] T21 S14 fallback + status line. Route: same worker.
 - [x] T22 S15 docs, CHANGELOG, version 0.5.0. Route: same worker.
-- [ ] T23 Verify (independent: concurrency + write gate are high risk), real Engram
+- [x] T23 Verify (independent: concurrency + write gate are high risk), real Engram
       3.6.0 isolated smoke of all 23 tools' binding, release v0.5.0, live install,
       remove the Engram MCP from Hermes. Route: parent.
 
@@ -423,6 +423,13 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   test_mcp_proxy.py:309-312, R3-003..R3-007, R4 fingerprint stale behind shims
   (mcp_proxy.py:354-365), restart budget never replenishes (850-856), status hides
   a dead proxy (provider.py:1796-1798).
+
+- L37 Release (T23, owner-approved "si procede"): main 8f35213, tag v0.5.0, CI and
+  Release green. Live: config backup ~/.hermes/config.yaml.bak-pre-recall-0.5.0;
+  `hermes plugins update recall` -> 0.5.0 at 8f35213; `hermes mcp remove engram`
+  done (no engram MCP left); `recall status` shows `tools: Engram MCP, 23 tools
+  (Engram 3.6.0)`. Takes effect after the owner's /restart. Scratch
+  /tmp/mcp_proxy_full.py deleted.
 
 ## Acceptance criteria
 
