@@ -124,6 +124,17 @@ def write_fake_binary(directory: Path) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def patient_identity_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the fake binary's ``instance-id`` probe room under a loaded machine.
+
+    The fake is a whole Python interpreter starting up; with the full suite
+    running, it intermittently missed the production 3 s bound and the spawn
+    tests saw ``unavailable`` (L14). No test here measures that bound.
+    """
+    monkeypatch.setattr(server_module, "INSTANCE_ID_TIMEOUT_S", 20.0)
+
+
 @pytest.fixture
 def no_spawn(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     """Fail loudly if anything tries to launch ``engram serve``."""

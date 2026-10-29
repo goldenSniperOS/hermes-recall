@@ -410,6 +410,12 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   `_shutting_down` under `_mcp_lock`). Spike memory #794 was overwritten by a worker
   upsert; restored as #796 (`hermes-recall/mcp-proxy-spike`).
 
+- L35 Fix (parent): the L14 flake is the fake binary's `instance-id` probe missing
+  the production 3 s bound while a whole Python interpreter starts under load. An
+  autouse fixture in tests/test_server.py raises `INSTANCE_ID_TIMEOUT_S` to 20 s for
+  those tests only (no test measures that bound). 5 full runs with two `yes` CPU
+  hogs: 919 passed each time. No deterministic RED is possible for a timing flake.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
