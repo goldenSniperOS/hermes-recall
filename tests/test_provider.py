@@ -427,6 +427,31 @@ def test_system_prompt_block_names_the_engram_3_6_tools() -> None:
     assert "`mem_session_finalize`" in block
 
 
+def test_system_prompt_block_reserves_summaries_for_explicit_closure() -> None:
+    # gentle-engram reserves session summaries for explicit closure (engram #1771):
+    # finishing a task or saying "done" is not a reason to summarize.
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "Before saying the work is done" not in block
+    assert 'Ordinary task completion or merely saying "done" does not' in block
+    assert block.index("explicit closure or handoff") < block.index("`mem_session_summary`")
+
+
+def test_system_prompt_block_persists_only_durable_knowledge() -> None:
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "costly to reconstruct" in block
+    assert "Never save secrets, credentials or personal data" in block
+    assert "routine progress" in block
+
+
+def test_system_prompt_block_reports_memory_honestly() -> None:
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "never claim a save that was not confirmed" in block
+    assert "Do not blindly repeat a write" in block
+
+
 def test_system_prompt_block_emits_no_memory_context_tags() -> None:
     assert "<memory-context>" not in SYSTEM_PROMPT_BLOCK
 

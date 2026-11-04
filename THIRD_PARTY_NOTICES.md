@@ -20,7 +20,8 @@ trademarks of Alan Buscaglia. See the README for the full notice.
 Behavior and text adapted from Engram:
 
 - The memory protocol in the provider system prompt block (adapted from
-  `plugin/pi/index.ts` `MEMORY_INSTRUCTIONS`).
+  `plugin/pi/index.ts` `MEMORY_INSTRUCTIONS`, refreshed at commit
+  d33a14a2ed822784752e5678b1673289ee1c0de4).
 - Private-tag redaction (adapted from `plugin/pi/private-redaction.js`).
 - Status wording such as `saved #<id>` (adapted from
   `plugin/pi/memory-tool-chrome.js`).

@@ -210,6 +210,15 @@ Since 0.4.0 it follows gentle-engram's protocol (`plugin/pi/index.ts`):
 - **Engram 3.6 tools:** `mem_consolidate` (preview, user approval, confirm with
   the fingerprint, never auto-confirm), `mem_judge_many`, and
   `mem_session_finalize` when the user closes or hands off the session.
+- **What to persist:** only verified knowledge that is durable and costly to
+  reconstruct, never routine progress, secrets, credentials or personal data.
+- **Honest reporting:** say when memory is down, never claim an unconfirmed save,
+  never blindly repeat a write.
+- **Session summaries only at explicit closure** (gentle-engram's "reserve session
+  summaries for explicit closure"): finishing a task or saying "done" does not
+  call `mem_session_summary`.
+
+The protocol was last refreshed against Engram `d33a14a2` (2026-11-01).
 
 Compaction recovery is not in this block, by design: the outcome-specific
 instruction travels in `on_pre_compress`'s return value (see "Hooks and tools"),

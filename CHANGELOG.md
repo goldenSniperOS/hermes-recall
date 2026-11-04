@@ -6,6 +6,15 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The system prompt block follows gentle-engram's current memory protocol
+  (Engram `d33a14a2`): `mem_session_summary` runs only at an explicit closure or
+  handoff, never just because a task finished or someone said "done"; only
+  verified knowledge that is costly to reconstruct is saved, never routine
+  progress, secrets, credentials or personal data; when memory is down the model
+  says so, never claims an unconfirmed save and does not blindly repeat a write.
+
 ## [0.5.0] - 2026-10-28
 
 The model's memory tools are now Engram's own MCP tools, proxied with the

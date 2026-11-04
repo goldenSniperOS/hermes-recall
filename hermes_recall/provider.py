@@ -185,11 +185,12 @@ to orient yourself.
 Persist a learning right after: a bug fix (with its root cause), an architecture
 or design decision, a non-obvious discovery about the codebase, a configuration or
 environment change, a pattern or convention established, or a user preference or
-constraint you learned.
+constraint you learned. Keep only verified knowledge costly to reconstruct, not
+routine progress. Never save secrets, credentials or personal data.
 
 A memory is an evolving topic, not a log entry:
 - Search first: `mem_search` the subject in the intended project and scope.
-- Read plausible hits in full with `mem_get_observation`; snippets are not enough.
+- Read plausible hits in full with `mem_get_observation`; snippets do not suffice.
 - Same topic? `mem_update` it by id with `expected_project` (its owner), keeping
   its `topic_key` and every still-valid fact.
 - New topic? `mem_save` with a distinct `topic_key`. Already covered? write nothing.
@@ -220,12 +221,15 @@ that no memory exists.
   Never auto-confirm, and never retry an uncertain confirmation.
 - `mem_judge_many` resolves several conflict candidates in one call.
 
+If memory is down, say so; never claim a save that was not confirmed.
+Do not blindly repeat a write.
+
 ### Closing
 
-Before saying the work is done, call `mem_session_summary` with Goal, Discoveries,
-Accomplished, Next Steps and Relevant Files. When the user closes or hands off the
-session, call `mem_session_finalize` with that summary instead: it saves it and
-ends the session in one step."""
+Only at explicit closure or handoff: `mem_session_summary` (Goal, Discoveries,
+Accomplished, Next Steps, Relevant Files), or `mem_session_finalize` to also end
+the session.
+Ordinary task completion or merely saying "done" does not require a summary."""
 
 
 @dataclass(frozen=True)
