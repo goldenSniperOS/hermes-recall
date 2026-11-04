@@ -6,6 +6,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-04
+
 ### Changed
 
 - The system prompt block follows gentle-engram's current memory protocol
