@@ -133,6 +133,7 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "scope": _s("project (default) | personal | global"),
             "topic_key": _s("Stable key for evolving topics (upsert)"),
             "project": _PROJECT,
+            "org": _STR,
         },
         ["title", "content"],
     ),
@@ -278,6 +279,8 @@ class ToolEnv:
     session_finalized: Callable[[str], None] | None = None
     # The ``project_provenance`` evidence for a write to the given project.
     provenance: Callable[[str], dict[str, str]] | None = None
+    # The working directory's Engram org label (``""`` when none); ``None`` means none.
+    resolve_org: Callable[[], str] | None = None
 
     def write_session_id(self) -> str:
         """The session id to attribute a write to right now."""
@@ -534,6 +537,7 @@ def _save(
     scope: str,
     topic_key: str,
     project: str,
+    org: str = "",
 ) -> dict[str, Any]:
     """POST /observations, registering the session once and retrying on a 404."""
     if not env.session_id:
@@ -550,6 +554,7 @@ def _save(
             project=project,
             scope=scope,
             topic_key=topic_key,
+            org=org,
             provenance=env.provenance(project) if env.provenance is not None else None,
         )
 
@@ -617,6 +622,7 @@ def _mem_save(env: ToolEnv, args: dict[str, Any]) -> dict[str, Any]:
         scope=_str_arg(args, "scope") or "project",
         topic_key=_str_arg(args, "topic_key"),
         project=project,
+        org=_str_arg(args, "org") or (env.resolve_org() if env.resolve_org is not None else ""),
     )
     result = _save_result(saved, project)
     _remember(env, result["id"], "saved", project)

@@ -1172,7 +1172,10 @@ def test_a_configured_project_is_sent_as_explicit_override(
     # Engram's `config` means `.engram/config.json`; `memory.recall.project` is the
     # caller explicitly supplying a project name (internal/project/detect.go).
     assert all(p == {"source": "explicit_override", "directory": WORKDIR} for _, p in rows)
-    assert fake_engram.find("GET", "/project/current") is None
+    # The override skips project detection; only `mem_save` asks once for the
+    # directory's org label, which an override never chooses (S16).
+    detections = [r for r in fake_engram.requests if r.path == "/project/current"]
+    assert len(detections) == 1
 
 
 def test_a_write_to_another_project_is_sent_as_unknown(

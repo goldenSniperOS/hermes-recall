@@ -326,6 +326,46 @@ def test_mem_save_request_status_and_state(
     assert state["project"] == PROJECT
 
 
+def test_mem_save_inherits_the_detected_org(fake_engram: FakeEngram, make_provider: Any) -> None:
+    wire(fake_engram)
+    fake_engram.route("GET", "/project/current", (200, {"project": PROJECT, "org": "acme"}))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    call(provider, "mem_save", title="t", content="c")
+
+    assert only(fake_engram, "POST", "/observations").json_body["org"] == "acme"
+
+
+def test_mem_save_explicit_org_wins(fake_engram: FakeEngram, make_provider: Any) -> None:
+    wire(fake_engram)
+    fake_engram.route("GET", "/project/current", (200, {"project": PROJECT, "org": "acme"}))
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    call(provider, "mem_save", title="t", content="c", org=" other-org ")
+
+    assert only(fake_engram, "POST", "/observations").json_body["org"] == "other-org"
+
+
+def test_mem_save_sends_no_org_when_none_is_known(
+    fake_engram: FakeEngram, make_provider: Any
+) -> None:
+    wire(fake_engram)
+    provider = make_provider(fake_engram.base_url)
+    fake_engram.reset()
+
+    call(provider, "mem_save", title="t", content="c")
+
+    assert "org" not in only(fake_engram, "POST", "/observations").json_body
+
+
+def test_mem_save_schema_offers_org() -> None:
+    schema = next(s for s in tools_module.get_tool_schemas() if s["name"] == "mem_save")
+
+    assert "org" in schema["parameters"]["properties"]
+
+
 def test_mem_save_defaults_type_and_scope(fake_engram: FakeEngram, make_provider: Any) -> None:
     wire(fake_engram)
     provider = make_provider(fake_engram.base_url)

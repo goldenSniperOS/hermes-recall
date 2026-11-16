@@ -121,6 +121,82 @@ def make_provider(hermes_home: Path, engram: FakeEngram, fake_mcp: FakeMcp) -> I
         provider.shutdown()
 
 
+# -- S16 org (Engram 3.7) ----------------------------------------------------------------
+
+ORG = "acme"
+
+
+def detect_org(engram: FakeEngram, org: str = ORG) -> None:
+    engram.route("GET", "/project/current", (200, {"project": PROJECT, "org": org}))
+
+
+def test_a_write_gets_the_detected_org(
+    make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram
+) -> None:
+    detect_org(engram)
+    provider = make_provider()
+
+    provider.handle_tool_call("mem_save", {"title": "t", "content": "c"})
+
+    assert args_of(fake_mcp, "mem_save") == [
+        {"title": "t", "content": "c", "org": ORG, "session_id": SESSION, "project": PROJECT}
+    ]
+
+
+def test_an_explicit_org_wins(make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram) -> None:
+    detect_org(engram)
+    provider = make_provider()
+
+    provider.handle_tool_call("mem_save", {"title": "t", "content": "c", "org": "other-org"})
+
+    assert args_of(fake_mcp, "mem_save")[0]["org"] == "other-org"
+
+
+def test_reads_never_get_an_org(make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram) -> None:
+    # On a read `org` is a filter: injecting it would silently narrow every search.
+    detect_org(engram)
+    provider = make_provider()
+
+    provider.handle_tool_call("mem_search", {"query": "q"})
+    provider.handle_tool_call("mem_list_projects", {})
+
+    assert "org" not in args_of(fake_mcp, "mem_search")[0]
+    assert args_of(fake_mcp, "mem_list_projects") == [{}]
+
+
+def test_a_write_without_an_org_parameter_gets_none(
+    make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram
+) -> None:
+    detect_org(engram)
+    provider = make_provider()
+
+    provider.handle_tool_call("mem_session_summary", {"content": "c"})
+
+    assert "org" not in args_of(fake_mcp, "mem_session_summary")[0]
+
+
+def test_a_project_override_keeps_the_directory_org(
+    make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram
+) -> None:
+    # "Project overrides do not change the caller directory's org label."
+    detect_org(engram)
+    provider = make_provider(project_override="pinned")
+
+    provider.handle_tool_call("mem_save", {"title": "t", "content": "c"})
+
+    saved = args_of(fake_mcp, "mem_save")[0]
+    assert (saved["project"], saved["org"]) == ("pinned", ORG)
+
+
+def test_a_blank_org_is_not_sent(make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram) -> None:
+    detect_org(engram, "  ")
+    provider = make_provider()
+
+    provider.handle_tool_call("mem_save", {"title": "t", "content": "c"})
+
+    assert "org" not in args_of(fake_mcp, "mem_save")[0]
+
+
 # -- S11 session and project injection ------------------------------------------------
 
 

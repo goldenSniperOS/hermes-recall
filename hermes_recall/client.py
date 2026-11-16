@@ -336,6 +336,7 @@ class EngramClient:
         scope: str = "project",
         topic_key: str = "",
         tool_name: str = "",
+        org: str = "",
         provenance: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """``POST /observations`` → ``{"id": <int>, "status": "saved"}`` (HTTP 201)."""
@@ -369,6 +370,7 @@ class EngramClient:
             ("scope", scope),
             ("topic_key", topic_key),
             ("tool_name", tool_name),
+            ("org", org),
         ):
             if value.strip():
                 body[key] = value

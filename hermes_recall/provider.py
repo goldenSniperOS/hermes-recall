@@ -278,6 +278,10 @@ class RecallProvider(MemoryProvider):
         self._project: str = ""
         self._project_source: str = ""
         self._project_detected: bool = False
+        # Engram 3.7's ``org`` label for the working directory (``""`` when none),
+        # detected with the project; proxied writes inherit it (S16).
+        self._org: str = ""
+        self._org_detected: bool = False
 
         # Recall state. Reset at the top of every prefetch so recall_status() can
         # only ever describe the last one.
@@ -619,6 +623,8 @@ class RecallProvider(MemoryProvider):
         """
         try:
             self._project_source = ""
+            self._org = ""
+            self._org_detected = False
             override = str(self._config.project_override or "").strip()
             if override:
                 self._project_source = PROVENANCE_OVERRIDE
@@ -628,6 +634,8 @@ class RecallProvider(MemoryProvider):
             payload = self._client.current_project(_working_directory())
             if not isinstance(payload, dict):
                 return ""
+            self._org = _org_of(payload)
+            self._org_detected = True
             project = payload.get("project")
             source = payload.get("project_source")
             self._project_source = source if isinstance(source, str) else ""
@@ -652,6 +660,26 @@ class RecallProvider(MemoryProvider):
             self._project = project
             self._project_detected = True
         return project
+
+    def _ensure_org(self) -> str:
+        """The working directory's Engram org (``""`` when none). Never raises.
+
+        Detected with the project. A ``memory.recall.project`` override skips that
+        detection (recall stays request-free), but it chooses the project, never the
+        directory's org label, so the first write that needs the org asks Engram once.
+        """
+        self._ensure_project()
+        if self._org_detected or self._foreign_reason():
+            return self._org
+        try:
+            payload = self._client.current_project(_working_directory())
+        except Exception:
+            logger.debug("recall: org detection failed (non-fatal)", exc_info=True)
+            return ""
+        if isinstance(payload, dict):
+            self._org = _org_of(payload)
+            self._org_detected = True
+        return self._org
 
     def _provenance(self, project: str) -> dict[str, str]:
         """The ``project_provenance`` evidence for a capture write to ``project``.
@@ -680,6 +708,8 @@ class RecallProvider(MemoryProvider):
         self._project = ""
         self._project_source = ""
         self._project_detected = False
+        self._org = ""
+        self._org_detected = False
         self._context_fetched = False
 
     def _reset_session_state(self) -> None:
@@ -1545,10 +1575,22 @@ class RecallProvider(MemoryProvider):
           can be confirmed (an id Engram does not know is refused ``unknown_session``).
         * ``mem_session_end``'s ``id``: recall's effective session.
 
+        * ``org``: the working directory's Engram org, for a write whose schema has
+          it and the model gave none (an explicit org wins). Never on a read, where
+          it is a filter.
+
         ``expected_project`` is never injected: it is the caller's assertion.
         ``own_session`` says the call names recall's session.
         """
         bound = dict(arguments)
+        if (
+            "org" in properties
+            and tool_name not in mcp_proxy.READ_TOOLS
+            and not _given(bound.get("org"))
+        ):
+            org = self._ensure_org()
+            if org:
+                bound["org"] = org
         if (
             "project" in properties
             and not _given(bound.get("project"))
@@ -1678,6 +1720,7 @@ class RecallProvider(MemoryProvider):
                 writes_enabled=self._writes_enabled,
                 agent_context=self._agent_context,
                 resolve_project=self._ensure_project,
+                resolve_org=self._ensure_org,
                 register_session=lambda project: self._register_session_now(
                     project, session_id=runtime_id
                 ),
@@ -1900,6 +1943,12 @@ def _room_for_call(deadline: float | None, timeout_s: float | None = None) -> bo
         return True
     budget = client_module.READ_TIMEOUT_S if timeout_s is None else timeout_s
     return (deadline - time.monotonic()) >= budget
+
+
+def _org_of(payload: dict[str, Any]) -> str:
+    """The ``org`` of a ``/project/current`` answer, stripped; ``""`` when none."""
+    org = payload.get("org")
+    return org.strip() if isinstance(org, str) else ""
 
 
 def _working_directory() -> str:

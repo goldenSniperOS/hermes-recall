@@ -431,6 +431,45 @@ spike 2026-10-28 (Engram memory #794, topic `hermes-recall/mcp-proxy-architectur
   (Engram 3.6.0)`. Takes effect after the owner's /restart. Scratch
   /tmp/mcp_proxy_full.py deleted.
 
+## v0.5.2 — Engram 3.7 `org` and the save-once protocol line
+
+Upstream audit d33a14a2..8a4ce2d (Engram v3.7.2, gentle-engram 0.8.0). Engram 3.7
+adds an optional `org` label (`.engram/config.json`); `GET /project/current` returns
+it, and MCP `mem_save` takes `org` but otherwise inherits it from the MCP child's
+own cwd, which is wrong for recall's single fixed-cwd child.
+
+### Specs
+
+- S16 Org on writes: recall detects `org` with the project (`/project/current` for
+  the working directory, also when `memory.recall.project` overrides the project:
+  "Project overrides do not change the caller directory's org label"). A proxied
+  write tool whose schema declares `org` gets the detected org when the model gave
+  none; an explicit `org` wins ("org wins when given explicitly"). Reads are never
+  given an org (it is a filter). The HTTP fallback `mem_save` takes an optional
+  `org` with the same inheritance and sends it in `POST /observations`. No org ->
+  nothing sent. Passive capture, prompts and summaries are unchanged (upstream
+  sends no org there).
+- S17 Protocol: `SYSTEM_PROMPT_BLOCK` carries upstream's "A request with several
+  fixes is saved once, when the request is done, unless one fix has a non-obvious
+  root cause worth its own entry. The save may share a turn with other tool calls;
+  it does not need a turn of its own." within the 2600-char, no-digit budget.
+
+### Tasks
+
+- T24 S16 org detection, MCP injection, HTTP mem_save org — inline, test-first.
+- T25 S17 protocol line — inline, test-first.
+- T26 docs (README, design), CHANGELOG 0.5.2, THIRD_PARTY_NOTICES refresh, version
+  bump; verify (Risk item 3: shared `_bind_arguments`).
+
+### Log
+
+- L38 User (2026-11-16): "Hay algunos cambios en el repo de gentle-engram? Cosas
+  que podemos portar a hermes-recall?" then "Dale avanza con 1 y 2, y por que no
+  el 3 también?" Item 3 (deferred tools, #2348) dropped: Hermes' tool_search never
+  defers memory-provider tools (not in the registry) and its bridge dispatches
+  through handle_function_call, so deferring would remove them; upstream's own rule
+  declares them direct when no bridge can reach them.
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
