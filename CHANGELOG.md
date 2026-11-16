@@ -6,6 +6,31 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-16
+
+Follows Engram v3.7.2 and gentle-engram 0.8.0 (Engram `8a4ce2d`).
+
+### Added
+
+- Writes inherit the working directory's Engram 3.7 `org` label from
+  `GET /project/current`: a proxied write whose schema declares `org` (today
+  `mem_save`) gets it when the model gives none, and an explicit `org` wins. Reads
+  never get it (it is a filter there). A `memory.recall.project` override keeps the
+  directory's org, asked once on the first write that needs it. The HTTP fallback
+  `mem_save` takes an optional `org` with the same inheritance. Session summaries,
+  passive capture and prompts send no org.
+
+### Changed
+
+- The system prompt block carries gentle-engram's save-once line: a request with
+  several fixes is saved once, when the request is done, unless one fix has a
+  non-obvious root cause worth its own entry, and the save may share a turn with
+  other tool calls. The block stays within its 2600-character budget.
+
+Not ported: gentle-engram's deferral of rarely used tools, because Hermes'
+`tool_search` cannot reach memory-provider tools, so deferring them would remove
+them.
+
 ## [0.5.1] - 2026-11-04
 
 ### Changed

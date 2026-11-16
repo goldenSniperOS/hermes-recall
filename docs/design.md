@@ -148,6 +148,7 @@ cached in-process only. `memory.recall.tools` filters the list (and the fallback
 | --- | --- | --- |
 | `session_id` | recall's effective Engram session (`<id>` or `<id>:resume:N`), registered first through `POST /sessions` | Schema has it, primary context, and the model named no other project (canonical names) and a registration is confirmed; the model's value is always dropped. An `unknown_session` answer re-registers and retries once |
 | `project` | the detected project (or `memory.recall.project`) | Schema has it, the model gave none, and `all_projects` is not true |
+| `org` | the working directory's Engram org (Engram 3.7, from `GET /project/current`) | Schema has it (today `mem_save`), the tool is a write, the model gave none and the directory has an org; an explicit `org` wins. Never on a read, where it is a filter |
 | `cwd` | the working directory | `mem_current_project` with neither `cwd` nor `directory` |
 | `id` | recall's effective session | `mem_session_end` |
 | `expected_project` | never | — |
@@ -156,6 +157,15 @@ cached in-process only. `memory.recall.tools` filters the list (and the fallback
 registers the given id under the project of the child's own cwd, while every write
 is already bound to recall's session. It registers recall's session and returns its
 effective id.
+
+The `org` is detected with the project from `GET /project/current` for the working
+directory. A `memory.recall.project` override skips that detection (recall stays
+request-free), but it chooses the project, not the directory's org label, so the
+first write that needs an org asks `/project/current` once. MCP
+`mem_session_summary` has no `org` parameter, so summaries carry no org through
+recall (upstream's MCP inherits it from the child's own cwd). Passive capture and
+prompt capture send no org, as upstream. The HTTP fallback `mem_save` takes an optional `org` with the same
+inheritance and sends it in `POST /observations`; no org means nothing is sent.
 
 ### Write gate
 
@@ -217,8 +227,14 @@ Since 0.4.0 it follows gentle-engram's protocol (`plugin/pi/index.ts`):
 - **Session summaries only at explicit closure** (gentle-engram's "reserve session
   summaries for explicit closure"): finishing a task or saying "done" does not
   call `mem_session_summary`.
+- **Save once per request:** a request with several fixes is saved once, when the
+  request is done, unless one fix has a non-obvious root cause worth its own
+  entry; the save may share a turn with other tool calls.
 
-The protocol was last refreshed against Engram `d33a14a2` (2026-11-01).
+The protocol was last refreshed against Engram `8a4ce2d` (2026-11-16, Engram
+v3.7.2 / gentle-engram 0.8.0). gentle-engram's deferral of rarely used tools is not
+ported: Hermes' `tool_search` cannot reach memory-provider tools, so deferring them
+would remove them.
 
 Compaction recovery is not in this block, by design: the outcome-specific
 instruction travels in `on_pre_compress`'s return value (see "Hooks and tools"),

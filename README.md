@@ -117,6 +117,8 @@ and fills in what it owns on every call:
 - `session_id`: the Hermes session, registered with Engram first (or its
   `:resume:N` continuation after a finalize), whatever the model sent.
 - `project`: the detected project, when the model gives none.
+- `org`: the working directory's Engram org (Engram 3.7), on writes such as
+  `mem_save` when the model gives none; reads never get it.
 - `cwd`: the working directory, for `mem_current_project`.
 
 `mem_session_start` reports that session instead of creating another one, and

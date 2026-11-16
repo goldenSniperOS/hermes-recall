@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 __all__ = ["__version__", "register"]
 
 

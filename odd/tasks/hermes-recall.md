@@ -456,10 +456,15 @@ own cwd, which is wrong for recall's single fixed-cwd child.
 
 ### Tasks
 
-- T24 S16 org detection, MCP injection, HTTP mem_save org — inline, test-first.
-- T25 S17 protocol line — inline, test-first.
+- T24 S16 org detection, MCP injection, HTTP mem_save org — inline, test-first: `253ee0f` (932 tests).
+- T25 S17 protocol line — inline, test-first: block 2585 chars (933 tests).
 - T26 docs (README, design), CHANGELOG 0.5.2, THIRD_PARTY_NOTICES refresh, version
-  bump; verify (Risk item 3: shared `_bind_arguments`).
+  bump; verify (Risk item 3: shared `_bind_arguments`): design Bindings `org` row and
+  inheritance notes (override, summaries, capture, HTTP fallback), save-once protocol
+  bullet, refresh line to Engram `8a4ce2d`; README `org` injection bullet; CHANGELOG
+  0.5.2 (Added S16, Changed S17, deferred tools not ported); THIRD_PARTY_NOTICES at
+  `8a4ce2d9`; version 0.5.2 in pyproject.toml, plugin.yaml, `__version__`
+  (933 tests, ruff clean). Pi gentle-ai-worker.
 
 ### Log
 
