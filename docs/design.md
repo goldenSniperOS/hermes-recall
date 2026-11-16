@@ -49,7 +49,7 @@ when it is served); the proxied tools are Engram's own MCP handlers.
 | `on_pre_compress` | `POST /observations` (`session_summary`), `GET /context/compaction` | Synchronous, 7 s budget, idempotent by hash |
 | `on_session_switch` / `on_session_end` | `POST /sessions` (`resume: true`), `POST /sessions/{id}/end` | `/end` de-duplicated; ends the effective session id; skipped after `mem_session_finalize` |
 | `mem_search` | `GET /search?response_format=compact` | Default project = detected project; accepts the compact `{result, results}` answer and the legacy bare array; `pinned: true` surfaced; snippet from `content` or `preview` |
-| `mem_save` | `POST /observations` | Registers the session and retries once on `session not found` |
+| `mem_save` | `POST /observations` | Registers the session and retries once on `session not found`; sends `org` (explicit, else the directory's) |
 | `mem_update` | `PATCH /observations/{id}?expected_project=` | `expected_project` required, never defaulted; only given fields are sent |
 | `mem_get_observation` | `GET /observations/{id}` (`?include_history=true&history_cursor=`) | History keys lifted out of `observation`; each version's content capped; an Engram without history gets a `history_note` |
 | `mem_context` | `GET /context` | |

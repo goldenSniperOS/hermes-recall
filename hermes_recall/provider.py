@@ -666,12 +666,17 @@ class RecallProvider(MemoryProvider):
     def _ensure_org(self) -> str:
         """The working directory's Engram org (``""`` when none). Never raises.
 
-        Detected with the project. A ``memory.recall.project`` override skips that
-        detection (recall stays request-free), but it chooses the project, never the
-        directory's org label, so the first write that needs the org asks Engram once.
+        Read from the last project detection; it never detects the project itself, so
+        a failed detection is not retried here. A ``memory.recall.project`` override
+        skips that detection (recall stays request-free), but it chooses the project,
+        never the directory's org label, so the first write that needs the org asks
+        Engram once.
         """
-        self._ensure_project()
-        if self._org_detected or self._foreign_reason():
+        if (
+            self._org_detected
+            or not str(self._config.project_override or "").strip()
+            or self._foreign_reason()
+        ):
             return self._org
         try:
             payload = self._client.current_project(_working_directory())
@@ -1585,11 +1590,21 @@ class RecallProvider(MemoryProvider):
         ``own_session`` says the call names recall's session.
         """
         bound = dict(arguments)
+        # One detection attempt per call: a failure is not memoised by
+        # ``_ensure_project``, and each binding below would otherwise re-ask.
+        attempts: list[str] = []
+
+        def own_project() -> str:
+            if not attempts:
+                attempts.append(self._ensure_project())
+            return attempts[0]
+
         if (
             "org" in properties
             and tool_name not in mcp_proxy.READ_TOOLS
             and not _given(bound.get("org"))
         ):
+            own_project()
             org = self._ensure_org()
             if org:
                 bound["org"] = org
@@ -1598,7 +1613,7 @@ class RecallProvider(MemoryProvider):
             and not _given(bound.get("project"))
             and not _truthy(bound.get("all_projects"))
         ):
-            project = self._ensure_project()
+            project = own_project()
             if project:
                 bound["project"] = project
         if (
@@ -1618,7 +1633,7 @@ class RecallProvider(MemoryProvider):
         bound.pop("session_id", None)
         if not runtime_id or not self._writes_enabled:
             return bound, False
-        own = self._ensure_project()
+        own = own_project()
         named = bound.get("project") if "project" in properties else None
         if not own or (
             _given(named)

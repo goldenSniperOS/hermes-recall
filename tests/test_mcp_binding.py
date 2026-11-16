@@ -197,6 +197,22 @@ def test_a_blank_org_is_not_sent(make_provider: Any, fake_mcp: FakeMcp, engram: 
     assert "org" not in args_of(fake_mcp, "mem_save")[0]
 
 
+def test_a_failed_detection_is_asked_once_per_write(
+    make_provider: Any, fake_mcp: FakeMcp, engram: FakeEngram
+) -> None:
+    # Engram down for detection: the org, project and session bindings share one
+    # attempt instead of each waiting on its own request.
+    provider = make_provider()
+    provider._reset_project_cache()
+    engram.route("GET", "/project/current", (500, {"error": "down"}))
+    engram.reset()
+
+    provider.handle_tool_call("mem_save", {"title": "t", "content": "c"})
+
+    assert len([r for r in engram.requests if r.path == "/project/current"]) == 1
+    assert args_of(fake_mcp, "mem_save") == [{"title": "t", "content": "c"}]
+
+
 # -- S11 session and project injection ------------------------------------------------
 
 

@@ -475,6 +475,14 @@ own cwd, which is wrong for recall's single fixed-cwd child.
   through handle_function_call, so deferring would remove them; upstream's own rule
   declares them direct when no bridge can reach them.
 
+- L39 Verify (T26, gentle-ai-verify): PASS with findings. S16 pass; S17 pass with the
+  clause "it does not need a turn of its own" trimmed (2621 chars verbatim, over
+  budget). Differential vs main over 414 `_bind_arguments` cases: 5 diffs, all the
+  intended `org` on `mem_save`. Fixed: a failed detection made 4 requests per proxied
+  write (main 2); now one attempt per call. design.md HTTP row names `org`. Kept:
+  HTTP `org` has no description (schema payload budget). RDD assess: medium,
+  reviewDue false (under_budget).
+
 ## Acceptance criteria
 
 - With `memory.provider: recall` and Engram running, every non-trivial turn shows
