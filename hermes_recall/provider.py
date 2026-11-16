@@ -182,11 +182,14 @@ to orient yourself.
 
 ### Saving (do this; do not wait to be asked)
 
-Persist a learning right after: a bug fix (with its root cause), an architecture
-or design decision, a non-obvious discovery about the codebase, a configuration or
-environment change, a pattern or convention established, or a user preference or
-constraint you learned. Keep only verified knowledge costly to reconstruct, not
-routine progress. Never save secrets, credentials or personal data.
+Persist a learning right after: a bug fix (with its root cause), a design
+decision, a non-obvious discovery, a configuration change, a pattern or
+convention, or a user preference or constraint. Keep only verified knowledge
+costly to reconstruct, not routine progress.
+Never save secrets, credentials or personal data.
+A request with several fixes is saved once, when the request is done,
+unless one fix has a non-obvious root cause worth its own entry. The save
+may share a turn with other tool calls.
 
 A memory is an evolving topic, not a log entry:
 - Search first: `mem_search` the subject in the intended project and scope.
@@ -204,20 +207,19 @@ Shape of a save:
   **What**: one sentence — what was done
   **Why**: what motivated it
   **Where**: files or paths affected
-  **Learned**: gotchas, edge cases, anything that surprised you
+  **Learned**: gotchas, edge cases, surprises
 
 ### Explicit recall
 
-Use `mem_search` or `mem_context` only when the user asks you to recall past work,
-or when the injected block is not enough — not to re-fetch what you already have.
+Use `mem_search` or `mem_context` only for past work the injected block lacks.
 `mem_search` is scoped to the current project. When it finds nothing, you must
 retry once with `match_mode: "any"` and `all_projects: true` before concluding
-that no memory exists.
+there is none.
 
 ### Maintenance
 
-- `mem_consolidate` merges duplicates of one topic: preview first, show the plan
-  to the user, and confirm with its `fingerprint` only after they approve it.
+- `mem_consolidate` merges duplicates of one topic: preview, show the user the
+  plan, and confirm with its `fingerprint` only after they approve it.
   Never auto-confirm, and never retry an uncertain confirmation.
 - `mem_judge_many` resolves several conflict candidates in one call.
 

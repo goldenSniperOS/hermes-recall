@@ -445,6 +445,15 @@ def test_system_prompt_block_persists_only_durable_knowledge() -> None:
     assert "routine progress" in block
 
 
+def test_system_prompt_block_saves_a_multi_fix_request_once() -> None:
+    # gentle-engram 0.8.0 (Engram 3.7): one save per request, not one per fix.
+    block = SYSTEM_PROMPT_BLOCK
+
+    assert "A request with several fixes is saved once, when the request is done" in block
+    assert "unless one fix has a non-obvious root cause worth its own entry" in block
+    assert "may share a turn with other tool calls" in block
+
+
 def test_system_prompt_block_reports_memory_honestly() -> None:
     block = SYSTEM_PROMPT_BLOCK
 
